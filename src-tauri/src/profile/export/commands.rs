@@ -229,7 +229,7 @@ pub fn copy_debug_info(app: AppHandle) -> Result<()> {
         .join("\n");
 
     let content = format!(
-        "OS: {}\nGale version: {}\n\nMods ({}):\n{}\n\nLatest log:\n{}",
+        "OS: {}\nSleepyMiles Mod Manager version (based on Gale): {}\n\nMods ({}):\n{}\n\nLatest log:\n{}",
         std::env::consts::OS,
         env!("CARGO_PKG_VERSION"),
         profile.mods.len(),

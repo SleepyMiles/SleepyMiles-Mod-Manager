@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.8
+
+- Window title, desktop shortcuts and messages say SleepyMiles Mod Manager instead of Gale.
+- If Windows blocks the app from creating its folders on first launch (usually antivirus such as Norton CyberCapture), the error now says so and what to do.
+
 ## 1.0.7
 
 - Mods published to SleepyMiles' site show up on the next **File → Fetch mods**, without waiting up to 10 minutes for GitHub's cache.

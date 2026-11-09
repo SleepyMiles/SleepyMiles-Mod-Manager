@@ -76,7 +76,7 @@ fn run_migrations(conn: &mut rusqlite::Connection) -> Result<()> {
         }
         SchemaVersion::Inside(version) => version.into(),
         SchemaVersion::Outside(_) => bail!(
-            "database has been modified by a newer version of Gale, please update to the latest version"
+            "database has been modified by a newer version of SleepyMiles Mod Manager, please update to the latest version"
         ),
     };
 
