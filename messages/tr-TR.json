@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "Modların ve profillerin depolandığı klasör. Bulunduğu sürücüde yeterli alan olduğundan emin olun.",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager veri klasörü",
 	"welcomeDialog_title": "SleepyMiles Mod Manager'e hoş geldiniz!",
-	"zoomFactorPref_title": "Yakınlaştırma faktörü"
+	"zoomFactorPref_title": "Yakınlaştırma faktörü",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

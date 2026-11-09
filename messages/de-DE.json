@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "Der Ordner, in dem Mods und Profile gespeichert werden. Stelle sicher, dass auf dem entsprechenden Laufwerk genügend Speicherplatz vorhanden ist.",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager-Datenordner",
 	"welcomeDialog_title": "Willkommen bei SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "Zoomfaktor"
+	"zoomFactorPref_title": "Zoomfaktor",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

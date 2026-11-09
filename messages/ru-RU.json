@@ -622,5 +622,8 @@
 	"welcomeDialog_settings_path_content": "Папка, где хранятся моды и профили. Убедитесь, что на этом диске достаточно места.",
 	"welcomeDialog_settings_path_title": "Папка данных SleepyMiles Mod Manager",
 	"welcomeDialog_title": "Добро пожаловать в SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "Масштаб интерфейса"
+	"zoomFactorPref_title": "Масштаб интерфейса",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "Folder, w którym przechowywane są mody i profile. Upewnij się, że masz na nim wystarczająco dużo miejsca.",
 	"welcomeDialog_settings_path_title": "Folder danych SleepyMiles Mod Manager",
 	"welcomeDialog_title": "Witaj w SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "Współczynnik powiększenia"
+	"zoomFactorPref_title": "Współczynnik powiększenia",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

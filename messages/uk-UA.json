@@ -543,5 +543,8 @@
 	"welcomeDialog_settings_path_content": "Папка, де зберігаються моди та профілі. Переконайтеся, що на пристрої достатньо місця.",
 	"welcomeDialog_settings_path_title": "Папка даних SleepyMiles Mod Manager",
 	"welcomeDialog_title": "Ласкаво просимо до SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "Масштаб"
+	"zoomFactorPref_title": "Масштаб",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

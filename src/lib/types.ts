@@ -174,6 +174,9 @@ export type SortBy =
 
 export type SortOrder = 'ascending' | 'descending';
 
+/** Which mod source(s) the browse page shows. */
+export type SourceFilter = 'all' | 'thunderstore' | 'sleepyMiles';
+
 export type QueryModsArgs = {
 	searchTerm: string;
 	includeCategories: string[];
@@ -184,6 +187,8 @@ export type QueryModsArgs = {
 	includeEnabled: boolean;
 	sortBy: SortBy;
 	sortOrder: SortOrder;
+	/** Only used on the browse page; missing means all sources. */
+	source?: SourceFilter;
 	maxCount: number | null;
 };
 

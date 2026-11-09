@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "儲存模組和設定檔的資料夾。請確定設備有充足的空間。",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager 資料資料夾",
 	"welcomeDialog_title": "歡迎使用 SleepyMiles Mod Manager！",
-	"zoomFactorPref_title": "縮放比例"
+	"zoomFactorPref_title": "縮放比例",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

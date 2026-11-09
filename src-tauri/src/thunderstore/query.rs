@@ -44,6 +44,26 @@ pub enum SortOrder {
     Descending,
 }
 
+/// Which mod source(s) the browse page shows.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceFilter {
+    #[default]
+    All,
+    Thunderstore,
+    SleepyMiles,
+}
+
+impl SourceFilter {
+    pub fn allows(self, backend: Backend) -> bool {
+        match self {
+            SourceFilter::All => true,
+            SourceFilter::Thunderstore => backend == Backend::Thunderstore,
+            SourceFilter::SleepyMiles => backend == Backend::SleepyMiles,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryModsArgs {
@@ -57,6 +77,9 @@ pub struct QueryModsArgs {
     pub include_enabled: bool,
     pub sort_by: SortBy,
     pub sort_order: SortOrder,
+    /// Missing in saved queries from older versions, so it defaults to showing every source.
+    #[serde(default)]
+    pub source: SourceFilter,
 }
 
 pub async fn query_loop(app: AppHandle) -> Result<()> {
@@ -136,6 +159,10 @@ impl Queryable for BorrowedMod<'_> {
 
     fn matches(&self, args: &QueryModsArgs) -> bool {
         let pkg = self.package;
+
+        if !args.source.allows(pkg.backend) {
+            return false;
+        }
 
         if !args.include_nsfw && pkg.has_nsfw_content
             || !args.include_deprecated && pkg.is_deprecated
@@ -369,4 +396,28 @@ where
     }
 
     deduped_mods.into_values()
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::{Backend, SourceFilter};
+
+    #[test]
+    fn source_filter_allows_the_right_backends() {
+        assert!(SourceFilter::All.allows(Backend::Thunderstore));
+        assert!(SourceFilter::All.allows(Backend::SleepyMiles));
+        assert!(SourceFilter::Thunderstore.allows(Backend::Thunderstore));
+        assert!(!SourceFilter::Thunderstore.allows(Backend::SleepyMiles));
+        assert!(SourceFilter::SleepyMiles.allows(Backend::SleepyMiles));
+        assert!(!SourceFilter::SleepyMiles.allows(Backend::Thunderstore));
+    }
+
+    #[test]
+    fn source_filter_reads_frontend_values_and_defaults_to_all() {
+        let f: SourceFilter = serde_json::from_str("\"sleepyMiles\"").unwrap();
+        assert_eq!(f, SourceFilter::SleepyMiles);
+        let f: SourceFilter = serde_json::from_str("\"thunderstore\"").unwrap();
+        assert_eq!(f, SourceFilter::Thunderstore);
+        assert_eq!(SourceFilter::default(), SourceFilter::All);
+    }
 }

@@ -118,10 +118,13 @@ const systemAccentColorPromise = api.prefs.getSystemAccentColor().then((color) =
 
 export const accentColorSetting = new ColorSetting(
 	'accent',
-	{ type: 'default', name: 'green' },
+	{ type: 'default', name: 'amber' },
 	systemAccentColorPromise
 );
-export const primaryColorSetting = new ColorSetting('primary', { type: 'default', name: 'slate' });
+export const primaryColorSetting = new ColorSetting('primary', {
+	type: 'default',
+	name: 'neutral'
+});
 
 const defaultFont = 'Inter';
 

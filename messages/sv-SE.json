@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "Mappen där moddar och profiler lagras. Se till att du har gott om utrymme på enheten.",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager-datamapp",
 	"welcomeDialog_title": "Välkommen till SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "Zoomfaktor"
+	"zoomFactorPref_title": "Zoomfaktor",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

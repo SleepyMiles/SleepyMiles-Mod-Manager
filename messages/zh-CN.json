@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "存放模组和档案的文件夹。请确保设备上留有充足的存储空间。",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager 数据文件夹",
 	"welcomeDialog_title": "欢迎来到 SleepyMiles Mod Manager!",
-	"zoomFactorPref_title": "缩放比例"
+	"zoomFactorPref_title": "缩放比例",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }

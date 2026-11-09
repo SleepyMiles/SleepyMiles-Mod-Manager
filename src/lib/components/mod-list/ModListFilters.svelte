@@ -1,7 +1,7 @@
 <script lang="ts">
 	import SearchBar from '$lib/components/ui/SearchBar.svelte';
 	import { selectItems } from '$lib/util';
-	import { type SortBy, type QueryModsArgsWithoutMax } from '$lib/types';
+	import { type SortBy, type SourceFilter, type QueryModsArgsWithoutMax } from '$lib/types';
 	import ModListCategoryFilter from './ModListCategoryFilter.svelte';
 	import Select from '$lib/components/ui/Select.svelte';
 	import { toSentenceCase } from '$lib/i18n';
@@ -10,9 +10,17 @@
 	type Props = {
 		sortOptions: SortBy[];
 		queryArgs: QueryModsArgsWithoutMax;
+		/** Show the Thunderstore / SleepyMiles' site picker (browse page only). */
+		showSource?: boolean;
 	};
 
-	let { sortOptions, queryArgs = $bindable() }: Props = $props();
+	let { sortOptions, queryArgs = $bindable(), showSource = false }: Props = $props();
+
+	const sourceLabels: Record<SourceFilter, string> = {
+		all: m.modListFilters_source_all(),
+		thunderstore: m.modListFilters_source_thunderstore(),
+		sleepyMiles: m.modListFilters_source_sleepyMiles()
+	};
 
 	function getSelectedIncludes() {
 		let selected = [];
@@ -48,7 +56,11 @@
 	}
 </script>
 
-<div class="mb-1.5 grid grid-cols-[2fr_1fr_1fr] gap-1.5">
+<div
+	class="mb-1.5 grid gap-1.5 {showSource
+		? 'grid-cols-[2fr_1fr_1fr_1fr]'
+		: 'grid-cols-[2fr_1fr_1fr]'}"
+>
 	<div class="relative grow-2">
 		<SearchBar
 			bind:value={queryArgs.searchTerm}
@@ -69,6 +81,22 @@
 		bind:value={queryArgs.sortBy}
 		type="single"
 	/>
+
+	{#if showSource}
+		<Select
+			icon={queryArgs.source === 'thunderstore'
+				? 'mdi:package-variant'
+				: queryArgs.source === 'sleepyMiles'
+					? 'mdi:web'
+					: 'mdi:source-merge'}
+			items={selectItems(
+				['all', 'thunderstore', 'sleepyMiles'] as SourceFilter[],
+				(s) => sourceLabels[s as SourceFilter]
+			)}
+			bind:value={() => queryArgs.source ?? 'all', (v) => (queryArgs.source = v as SourceFilter)}
+			type="single"
+		/>
+	{/if}
 </div>
 
 <div class="mb-1.5 grid grid-cols-[2fr_2fr_auto] gap-1.5">

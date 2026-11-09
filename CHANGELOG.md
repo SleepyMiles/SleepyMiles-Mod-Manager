@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3
+
+- New default colors: Neutral (primary) and Amber (accent).
+- Browse page has a source picker: All sources, Thunderstore, or SleepyMiles' site.
+
 ## 1.0.2
 
 - Fixed the app closing immediately on first launch (it tried to open a game that was removed).

@@ -143,7 +143,7 @@
 
 <div class="flex grow overflow-hidden">
 	<div class="flex w-[60%] grow flex-col overflow-hidden px-4 pt-4">
-		<ModListFilters {sortOptions} bind:queryArgs={modQuery.current} />
+		<ModListFilters {sortOptions} bind:queryArgs={modQuery.current} showSource />
 
 		{#if locked}
 			<ProfileLockedBanner class="mb-1" />

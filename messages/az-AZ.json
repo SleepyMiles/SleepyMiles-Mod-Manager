@@ -540,5 +540,8 @@
 	"welcomeDialog_settings_path_content": "Modların və profillərin saxlandığı qovluq. Həmin cihazda kifayət qədər boş yer olduğuna əmin olun.",
 	"welcomeDialog_settings_path_title": "SleepyMiles Mod Manager məlumat qovluğu",
 	"welcomeDialog_title": "SleepyMiles Mod Manager-ə xoş gəlmisiniz!",
-	"zoomFactorPref_title": "Miqyas əmsalı"
+	"zoomFactorPref_title": "Miqyas əmsalı",
+	"modListFilters_source_all": "All sources",
+	"modListFilters_source_thunderstore": "Thunderstore",
+	"modListFilters_source_sleepyMiles": "SleepyMiles' site"
 }
