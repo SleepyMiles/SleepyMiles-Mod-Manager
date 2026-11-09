@@ -32,7 +32,7 @@ const ALLOWED_LOGIN: &str = "SleepyMiles";
 /// Client ID of the "SleepyMiles Mod Manager" OAuth App on SleepyMiles' GitHub account
 /// (Settings -> Developer settings -> OAuth Apps, with "Enable Device Flow" ticked).
 /// Client IDs are public; device flow needs no client secret.
-const GITHUB_CLIENT_ID: &str = "REPLACE_WITH_OAUTH_CLIENT_ID";
+const GITHUB_CLIENT_ID: &str = "Ov23liAvteaTQHaquzIL";
 
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]

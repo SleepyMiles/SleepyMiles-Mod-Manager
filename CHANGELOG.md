@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6
+
+- Upload page in the sidebar (cloud icon, under Modpack) for publishing mods to SleepyMiles' site.
+- "Log in with GitHub" instead of pasting a token. Only the SleepyMiles account can upload.
+- Removed the hidden Ctrl+Alt+U upload window from 1.0.5.
+
 ## 1.0.5
 
 - Upload mods to SleepyMiles' site from the app (Ctrl+Alt+U): pick a zip, check it, publish. Needs a GitHub token with write access to the site's repository.

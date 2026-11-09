@@ -22,9 +22,9 @@ The site ([SleepyMiles/miles-lc-mods](https://github.com/SleepyMiles/miles-lc-mo
 
 ## Publishing mods to the site
 
-Press **Ctrl+Alt+U** in the app. The first time, paste a GitHub fine-grained token (repository **miles-lc-mods**, permission **Contents: Read and write**); it's kept in Windows Credential Manager. Then choose a mod zip: the app checks `manifest.json` the same way the site does, shows the mod, and **Publish** creates the `<Name>-<version>` release with the zip. The site's publish workflow adds it to the site and to the app's mod list a minute or two later. To update a mod, raise `version_number` and publish again.
+Click the **Upload** icon in the sidebar (under Modpack) and **Log in with GitHub**. Only the `SleepyMiles` account is accepted. Choose a mod zip: the app checks `manifest.json` the same way the site does, shows the mod, and **Publish** creates the `<Name>-<version>` release with the zip. The site's publish workflow adds it to the site and to the app's mod list a minute or two later. To update a mod, raise `version_number` and publish again.
 
-The code is in `src-tauri/src/site_upload.rs` and `src/lib/components/dialogs/UploadSiteModDialog.svelte`.
+Login uses GitHub's device flow with the "SleepyMiles Mod Manager" OAuth App (client ID in `src-tauri/src/site_upload.rs`). The code is in `src-tauri/src/site_upload.rs` and `src/routes/upload/+page.svelte`.
 
 ## Releasing a new version
 
