@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.7
+
+- Mods published to SleepyMiles' site show up on the next **File → Fetch mods**, without waiting up to 10 minutes for GitHub's cache.
+
 ## 1.0.6
 
 - Upload page in the sidebar (cloud icon, under Modpack) for publishing mods to SleepyMiles' site.

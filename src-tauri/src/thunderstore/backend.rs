@@ -61,7 +61,15 @@ impl Backend {
                     "https://thunderstore.io/c/{}/api/v1/package-listing-index/",
                     game.slug
                 ),
-                Backend::SleepyMiles => format!("{SITE_URL}api/v1/package-listing-index.gz"),
+                // GitHub Pages' CDN keeps files for up to 10 minutes; a unique query gets a fresh copy,
+                // so a mod published from the Upload page shows up on the next fetch.
+                Backend::SleepyMiles => format!(
+                    "{SITE_URL}api/v1/package-listing-index.gz?t={}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ),
             })
         } else {
             None
