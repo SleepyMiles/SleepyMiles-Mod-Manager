@@ -41,7 +41,7 @@
 		</p>
 		<div class="mt-3 flex items-center gap-2">
 			<Icon icon="mdi:file-document" class="text-primary-900 text-xl dark:text-white" />
-			<Link href="https://github.com/SleepyMiles/SleepyMiles-Mod-Manager/blob/master/CHANGELOG.md"
+			<Link href="https://github.com/SleepyMiles/SleepyMiles-Mod-Manager/blob/main/CHANGELOG.md"
 				>{m.aboutDialog_changelog()}</Link
 			>
 		</div>
