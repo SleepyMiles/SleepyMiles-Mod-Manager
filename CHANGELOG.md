@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.5
+
+- Upload mods to SleepyMiles' site from the app (Ctrl+Alt+U): pick a zip, check it, publish. Needs a GitHub token with write access to the site's repository.
+
 ## 1.0.4
 
 - New app icon in the style of SleepyMiles' mod posters, and a matching small icon next to the File menu.

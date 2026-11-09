@@ -12,6 +12,7 @@
 	import ImportProfileDialog from '$lib/components/dialogs/ImportProfileDialog.svelte';
 	import AboutDialog from '$lib/components/dialogs/AboutDialog.svelte';
 	import CreateProfileDialog from '$lib/components/dialogs/CreateProfileDialog.svelte';
+	import UploadSiteModDialog from '$lib/components/dialogs/UploadSiteModDialog.svelte';
 
 	import MenubarItem from './MenubarItem.svelte';
 	import MenubarMenu from './MenubarMenu.svelte';
@@ -42,6 +43,8 @@
 	let profileOperationInProgress = $state(false);
 
 	let aboutOpen = $state(false);
+	// Publishing to SleepyMiles' site: no menu item, opened with Ctrl+Alt+U.
+	let uploadSiteModOpen = $state(false);
 
 	let menu: Menu | null = $state(null);
 
@@ -418,7 +421,13 @@
 	};
 
 	onMount(async () => {
-		document.onkeydown = ({ key, ctrlKey }) => {
+		document.onkeydown = ({ key, code, ctrlKey, altKey }) => {
+			// Not in any menu, so it works with the native menu too.
+			if (ctrlKey && altKey && code === 'KeyU') {
+				uploadSiteModOpen = true;
+				return;
+			}
+
 			if (useNativeMenu.current) return; // Tauri handles shortcuts to the native menu
 
 			if (key === 'F2') {
@@ -552,6 +561,7 @@
 </Dialog>
 
 <AboutDialog bind:open={aboutOpen} />
+<UploadSiteModDialog bind:open={uploadSiteModOpen} />
 <ImportR2Dialog bind:open={importR2Open} />
 <CreateProfileDialog bind:open={newProfileOpen} />
 <ExportCodeDialog bind:this={exportCodeDialog} />

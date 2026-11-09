@@ -15,6 +15,7 @@ mod game;
 mod logger;
 mod prefs;
 mod profile;
+mod site_upload;
 mod state;
 mod thunderstore;
 mod util;
@@ -127,6 +128,8 @@ pub fn run() {
             thunderstore::commands::set_api_token,
             thunderstore::commands::has_api_token,
             thunderstore::commands::clear_api_token,
+            site_upload::inspect_site_mod,
+            site_upload::publish_site_mod,
             thunderstore::commands::trigger_mod_fetch,
             thunderstore::commands::get_categories,
             prefs::commands::get_prefs,
