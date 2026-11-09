@@ -32,6 +32,12 @@
 			disabled: modpacksDisabled
 		},
 		{
+			// Publishing mods to SleepyMiles' site. Only works when logged in as SleepyMiles.
+			to: '/upload',
+			icon: 'mdi:cloud-upload',
+			tooltip: "Upload to SleepyMiles' site"
+		},
+		{
 			to: '/prefs',
 			icon: 'mdi:cog',
 			tooltip: m.navBar_link_prefs()

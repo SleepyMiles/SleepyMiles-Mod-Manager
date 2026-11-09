@@ -26,6 +26,14 @@ use crate::{
 const REPO: &str = "SleepyMiles/miles-lc-mods";
 const API: &str = "https://api.github.com";
 
+/// The only GitHub account allowed to publish.
+const ALLOWED_LOGIN: &str = "SleepyMiles";
+
+/// Client ID of the "SleepyMiles Mod Manager" OAuth App on SleepyMiles' GitHub account
+/// (Settings -> Developer settings -> OAuth Apps, with "Enable Device Flow" ticked).
+/// Client IDs are public; device flow needs no client secret.
+const GITHUB_CLIENT_ID: &str = "REPLACE_WITH_OAUTH_CLIENT_ID";
+
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SiteModInfo {
@@ -188,7 +196,141 @@ fn is_dependency(dep: &str) -> bool {
 
 fn github_token() -> Result<String> {
     token::get(Backend::SleepyMiles)?
-        .ok_or_else(|| eyre!("no GitHub token saved yet; add one in the upload window first"))
+        .ok_or_else(|| eyre!("you're not logged in to GitHub yet"))
+}
+
+// ---------------------------------------------------------------- GitHub login (device flow)
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLogin {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum LoginPoll {
+    /// Waiting for the code to be entered on github.com. Poll again after `interval` seconds.
+    Pending { interval: u64 },
+    LoggedIn { login: String },
+}
+
+fn client_id() -> Result<&'static str> {
+    if GITHUB_CLIENT_ID.starts_with("REPLACE_") {
+        bail!("GitHub login isn't set up in this build yet (missing OAuth client ID)");
+    }
+    Ok(GITHUB_CLIENT_ID)
+}
+
+#[command]
+pub async fn site_login_start(app: AppHandle) -> crate::util::cmd::Result<DeviceLogin> {
+    let response = app
+        .http()
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .json(&json!({ "client_id": client_id()?, "scope": "public_repo" }))
+        .send()
+        .await
+        .map_err(|err| eyre!("couldn't reach GitHub: {err}"))?;
+    let v: Value = response.json().await.map_err(|err| eyre!("{err}"))?;
+    if let Some(err) = v.get("error_description").or(v.get("error")).and_then(Value::as_str) {
+        return Err(eyre!("GitHub login failed: {err}").into());
+    }
+    let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let n = |k: &str, d: u64| v.get(k).and_then(Value::as_u64).unwrap_or(d);
+    Ok(DeviceLogin {
+        device_code: s("device_code"),
+        user_code: s("user_code"),
+        verification_uri: s("verification_uri"),
+        interval: n("interval", 5),
+        expires_in: n("expires_in", 900),
+    })
+}
+
+/// One poll of GitHub's token endpoint. Saves the token only if it belongs to SleepyMiles.
+#[command]
+pub async fn site_login_poll(
+    device_code: String,
+    interval: u64,
+    app: AppHandle,
+) -> crate::util::cmd::Result<LoginPoll> {
+    let response = app
+        .http()
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .json(&json!({
+            "client_id": client_id()?,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        }))
+        .send()
+        .await
+        .map_err(|err| eyre!("couldn't reach GitHub: {err}"))?;
+    let v: Value = response.json().await.map_err(|err| eyre!("{err}"))?;
+
+    if let Some(token) = v.get("access_token").and_then(Value::as_str) {
+        let login = account_login(&app, token).await?;
+        if !login.eq_ignore_ascii_case(ALLOWED_LOGIN) {
+            return Err(eyre!(
+                "only {ALLOWED_LOGIN} can upload to the site (you logged in as {login})"
+            )
+            .into());
+        }
+        token::set(Backend::SleepyMiles, token)?;
+        info!("logged in to GitHub as {login}");
+        return Ok(LoginPoll::LoggedIn { login });
+    }
+
+    match v.get("error").and_then(Value::as_str) {
+        Some("authorization_pending") => Ok(LoginPoll::Pending { interval }),
+        Some("slow_down") => Ok(LoginPoll::Pending {
+            interval: v.get("interval").and_then(Value::as_u64).unwrap_or(interval + 5),
+        }),
+        Some("expired_token") => Err(eyre!("the login code expired; start again").into()),
+        Some("access_denied") => Err(eyre!("the login was cancelled on GitHub").into()),
+        Some(other) => Err(eyre!(
+            "GitHub login failed: {}",
+            v.get("error_description").and_then(Value::as_str).unwrap_or(other)
+        )
+        .into()),
+        None => Err(eyre!("GitHub sent an unexpected answer").into()),
+    }
+}
+
+async fn account_login(app: &AppHandle, token: &str) -> Result<String> {
+    let response = github(app, reqwest::Method::GET, &format!("{API}/user"), token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(explain(response, "read your GitHub account").await);
+    }
+    let v: Value = response.json().await?;
+    v.get("login")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("GitHub didn't say which account this is"))
+}
+
+/// The logged-in account, or None when logged out or the saved login no longer works.
+#[command]
+pub async fn site_account(app: AppHandle) -> crate::util::cmd::Result<Option<String>> {
+    let Some(token) = token::get(Backend::SleepyMiles)? else {
+        return Ok(None);
+    };
+    match account_login(&app, &token).await {
+        Ok(login) if login.eq_ignore_ascii_case(ALLOWED_LOGIN) => Ok(Some(login)),
+        Ok(_) | Err(_) => Ok(None),
+    }
+}
+
+#[command]
+pub fn site_logout() -> crate::util::cmd::Result<()> {
+    token::clear(Backend::SleepyMiles)?;
+    Ok(())
 }
 
 fn github(
@@ -213,9 +355,9 @@ async fn explain(response: reqwest::Response, action: &str) -> eyre::Report {
         .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or(body);
     match status.as_u16() {
-        401 => eyre!("GitHub rejected the token while trying to {action} (it may have expired). Save a new one in the upload window."),
+        401 => eyre!("your GitHub login expired while trying to {action}. Log in again."),
         403 | 404 => eyre!(
-            "the token isn't allowed to {action}. It needs \"Contents: Read and write\" on {REPO}. (GitHub said: {detail})"
+            "your GitHub login isn't allowed to {action} on {REPO}. Log out and log in again. (GitHub said: {detail})"
         ),
         _ => eyre!("couldn't {action}: GitHub answered {status}: {detail}"),
     }
@@ -258,6 +400,10 @@ pub async fn publish_site_mod(path: PathBuf, app: AppHandle) -> crate::util::cmd
 
 async fn publish(path: &Path, app: &AppHandle) -> Result<String> {
     let token = github_token()?;
+    let login = account_login(app, &token).await?;
+    if !login.eq_ignore_ascii_case(ALLOWED_LOGIN) {
+        bail!("only {ALLOWED_LOGIN} can upload to the site (logged in as {login})");
+    }
     let info = read_mod_zip(path)?;
     if let Some(problem) = info.problems.first() {
         bail!("{problem}");
