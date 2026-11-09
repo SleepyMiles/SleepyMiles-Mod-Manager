@@ -23,7 +23,7 @@ The site ([SleepyMiles/miles-lc-mods](https://github.com/SleepyMiles/miles-lc-mo
 ## Releasing a new version
 
 1. Add a section to `CHANGELOG.md`.
-2. **Actions → Release → Run workflow**, type the new version (for example `1.0.1`), and run it.
+2. On GitHub, open the `VERSION` file, click the pencil, change it to the new version (for example `1.0.1`), and **Commit changes**. That starts the build. (**Actions → Release → Run workflow** also works.)
 3. After about 15–20 minutes the release appears with the installer, and installed copies update themselves.
 
 The workflow needs the `TAURI_SIGNING_PRIVATE_KEY` repository secret (the updater signing key). Keep that key safe: without it, existing installs can't be updated.

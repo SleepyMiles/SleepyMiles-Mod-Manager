@@ -1,21 +1,21 @@
 # Builds the Windows installer and publishes a GitHub Release with the auto-update files.
 #
-# To release: Actions tab -> "Release" -> Run workflow -> type the new version (e.g. 1.0.1).
-# (Pushing a tag like v1.0.1 also works.)
+# To release: edit the VERSION file on GitHub (e.g. change it to 1.0.1) and commit.
+# (Or: Actions tab -> "Release" -> Run workflow -> type the version.)
 #
 # Needs one repository secret: TAURI_SIGNING_PRIVATE_KEY (the updater signing key).
 name: Release
-run-name: Release ${{ inputs.version || github.ref_name }}
+run-name: Release ${{ inputs.version || 'from VERSION file' }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release, like 1.0.1
-        required: true
+        description: Version to release, like 1.0.1 (leave empty to use the VERSION file)
+        required: false
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: [main]
+    paths: [VERSION]
 
 permissions:
   contents: write
@@ -38,7 +38,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          v="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          v="${INPUT_VERSION:-$(tr -d '[:space:]' < VERSION)}"
           if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version must look like 1.0.1 (got '$v')."
             exit 1
