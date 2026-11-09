@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2
+
+- Fixed the app closing immediately on first launch (it tried to open a game that was removed).
+
+## 1.0.1
+
+- Same as 1.0.0 (still has the launch crash).
+
 ## 1.0.0
 
 First release of SleepyMiles Mod Manager, based on [Gale](https://github.com/Kesomannen/gale) 1.23.3.

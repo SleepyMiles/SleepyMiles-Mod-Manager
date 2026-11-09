@@ -554,7 +554,7 @@ impl ManagedGame {
 
 impl ModManager {
     pub fn create(data: db::SaveData, prefs: &Prefs, db: &Db) -> Result<Self> {
-        const DEFAULT_GAME_SLUG: &str = "among-us";
+        const DEFAULT_GAME_SLUG: &str = "lethal-company";
 
         let db::SaveData {
             manager,
