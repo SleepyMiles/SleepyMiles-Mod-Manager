@@ -1,0 +1,44 @@
+use std::sync::LazyLock;
+
+use crate::thunderstore::Backend;
+use eyre::Result;
+use keyring::Entry;
+use tracing::info;
+
+static THUNDERSTORE_ENTRY: LazyLock<keyring::Result<Entry>> =
+    LazyLock::new(|| Entry::new("thunderstore", "api_token"));
+static SLEEPYMILES_ENTRY: LazyLock<keyring::Result<Entry>> =
+    LazyLock::new(|| Entry::new("sleepymiles", "api_token"));
+
+fn entry(backend: Backend) -> Result<&'static keyring::Entry> {
+    let entry = match backend {
+        Backend::Thunderstore => &*THUNDERSTORE_ENTRY,
+        Backend::SleepyMiles => &*SLEEPYMILES_ENTRY,
+    };
+    match entry {
+        Ok(entry) => Ok(entry),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub fn get(backend: Backend) -> Result<Option<String>> {
+    match entry(backend)?.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+pub fn set(backend: Backend, token: &str) -> Result<()> {
+    info!("setting {backend} token");
+    entry(backend)?.set_password(token)?;
+    Ok(())
+}
+
+pub fn clear(backend: Backend) -> Result<()> {
+    info!("clearing {backend} token");
+    match entry(backend)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}

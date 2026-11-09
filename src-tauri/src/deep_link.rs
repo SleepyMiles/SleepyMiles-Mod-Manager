@@ -1,0 +1,165 @@
+use std::{fmt::Debug, future::Future, path::PathBuf};
+
+use eyre::{Context, OptionExt, Result};
+use tauri::{AppHandle, Manager};
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::{
+    logger,
+    profile::{self, import::commands::FrontendImportData},
+    state::ManagerExt,
+    thunderstore::{self, Backend, FrontendMod},
+};
+
+pub fn handle(app: &AppHandle, url: String) -> bool {
+    app.get_webview_window("main")
+        .expect("app should have main window")
+        .set_focus()
+        .ok();
+
+    let app = app.to_owned();
+
+    if url.starts_with("ror2mm://") {
+        handle_inner_task(app.clone(), handle_r2_install(url, app));
+    } else if url.starts_with("sleepymm://install/") {
+        handle_inner_task(app.clone(), handle_gale_install(url, app));
+    } else if url.starts_with("sleepymm://auth/callback") {
+        handle_inner_task(app.clone(), async move {
+            profile::sync::auth::handle_callback(url, &app)
+        });
+    } else if url.starts_with("sleepymm://profile/import") {
+        handle_inner_task(app.clone(), import_profile_code(url, app));
+    } else if url.starts_with("sleepymm://profile/sync/clone") {
+        handle_inner_task(app.clone(), clone_sync_profile(url, app));
+    } else if url.ends_with("r2z") {
+        handle_inner_task(
+            app.clone(),
+            async move { import_profile_file(&url, &app).await },
+        );
+    } else {
+        warn!("unsupported deep link protocol: {}", url);
+        return false;
+    }
+
+    true
+}
+
+fn handle_inner_task<T, Fut>(app: AppHandle, task: Fut)
+where
+    Fut: Future<Output = Result<T>> + Send + 'static,
+    T: Debug,
+{
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = task.await {
+            logger::log_webview_err("Failed to handle deep link", err, &app);
+        }
+    });
+}
+
+struct InstallPackage<'a> {
+    owner: &'a str,
+    name: &'a str,
+    version: &'a str,
+    backend: Backend,
+}
+
+impl<'a> InstallPackage<'a> {
+    fn parse(path: &'a str, backend: Backend) -> Option<Self> {
+        let mut split = path.split('/');
+        let (owner, name, version) = (split.next()?, split.next()?, split.next()?);
+
+        Some(Self {
+            owner,
+            name,
+            version,
+            backend,
+        })
+    }
+}
+
+async fn handle_r2_install(url: String, app: AppHandle) -> Result<()> {
+    let package = url
+        .strip_prefix("ror2mm://v1/install/thunderstore.io/")
+        .and_then(|path| InstallPackage::parse(path, Backend::Thunderstore))
+        .ok_or_eyre("invalid package url")?;
+
+    handle_install(package, app).await
+}
+
+async fn handle_gale_install(url: String, app: AppHandle) -> Result<()> {
+    let package = url
+        .strip_prefix("sleepymm://install/")
+        .and_then(|rest| {
+            let (platform, package_path) = rest.split_once('/')?;
+            let backend = platform.parse::<Backend>().ok()?;
+
+            InstallPackage::parse(package_path, backend)
+        })
+        .ok_or_eyre("invalid package url")?;
+
+    handle_install(package, app).await
+}
+
+async fn handle_install(package: InstallPackage<'_>, app: AppHandle) -> Result<()> {
+    thunderstore::wait_for_fetch(&app).await;
+
+    let thunderstore = app.lock_thunderstore();
+    let borrowed_mod = thunderstore.find_mod(
+        package.owner,
+        package.name,
+        package.version,
+        package.backend,
+    )?;
+
+    app.emit_buffered("install_mod", &FrontendMod::from(borrowed_mod));
+
+    Ok(())
+}
+
+async fn import_profile_file(url: &str, app: &AppHandle) -> Result<()> {
+    let path = PathBuf::from(url);
+
+    info!(
+        "importing profile file from deep link at {}",
+        path.display()
+    );
+
+    thunderstore::wait_for_fetch(app).await;
+
+    let import_data = profile::import::read_file_at_path(path, &app.lock_thunderstore())?;
+
+    app.emit_buffered("import_profile", &FrontendImportData::new(import_data, app));
+
+    Ok(())
+}
+
+async fn import_profile_code(url: String, app: AppHandle) -> Result<()> {
+    let key = url
+        .strip_prefix("sleepymm://profile/import/")
+        .ok_or_eyre("invalid url format")
+        .and_then(|str| Uuid::parse_str(str).context("invalid UUID"))?;
+
+    thunderstore::wait_for_fetch(&app).await;
+
+    let import_data = profile::import::read_code(key, &app).await?;
+
+    app.emit_buffered(
+        "import_profile",
+        &FrontendImportData::new(import_data, &app),
+    );
+
+    Ok(())
+}
+
+async fn clone_sync_profile(url: String, app: AppHandle) -> Result<()> {
+    let id = url
+        .strip_prefix("sleepymm://profile/sync/clone/")
+        .ok_or_eyre("invalid url format")?;
+
+    let import_data = profile::sync::read_profile(id, &app).await?;
+
+    app.emit_buffered("import_profile", &import_data);
+
+    Ok(())
+}

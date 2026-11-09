@@ -1,0 +1,191 @@
+<script lang="ts">
+	import profiles from '$lib/state/profile.svelte';
+	import type { InstallEvent, InstallTask } from '$lib/types';
+	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+	import { Popover, Progress } from 'bits-ui';
+	import { onDestroy, onMount } from 'svelte';
+	import Icon from '@iconify/svelte';
+	import { fade, fly, scale } from 'svelte/transition';
+	import { expoInOut, quadOut } from 'svelte/easing';
+	import { dropIn, dropOut } from '$lib/transitions';
+	import { Tween } from 'svelte/motion';
+	import IconButton from '$lib/components/ui/IconButton.svelte';
+	import * as api from '$lib/api';
+	import { m } from '$lib/paraglide/messages';
+
+	let shown = $state(false);
+	let showCancel = $state(false);
+	let open = $state(false);
+
+	let totalMods = $state(0);
+	let totalBytes = $state(0);
+
+	let completedMods = $state(0);
+	let completedBytes = $state(0);
+
+	let name: string | null = $state(null);
+	let task: InstallTask | null = $state(null);
+
+	let hideTimeout: NodeJS.Timeout | null = $state(null);
+
+	let taskText = $derived(
+		task
+			? {
+					download: m.installPopover_taskText_download(),
+					extract: m.installPopover_taskText_extract(),
+					install: m.installPopover_taskText_install()
+				}[task] + name!.replace(/_/g, ' ')
+			: null
+	);
+
+	let progress = $derived(totalBytes === 0 ? 0 : completedBytes / totalBytes);
+	let shownProgress = new Tween(0);
+
+	$effect(() => {
+		shownProgress.target = progress;
+	});
+
+	let unlisten: UnlistenFn | null = null;
+
+	onMount(async () => {
+		unlisten = await listen<InstallEvent>('install_event', (event) => {
+			switch (event.payload.type) {
+				case 'show':
+					shown = true;
+					open = true;
+					showCancel = true;
+
+					if (hideTimeout) {
+						clearTimeout(hideTimeout);
+					}
+
+					break;
+
+				case 'hide':
+					showCancel = false;
+
+					let hideDelay = 0;
+					if (event.payload.reason === 'done') {
+						hideDelay = 500;
+
+						taskText = m.installPopover_taskText_done();
+						shownProgress.set(1, { duration: 250, easing: expoInOut });
+					}
+
+					hideTimeout = setTimeout(() => {
+						open = false;
+
+						totalMods = 0;
+						totalBytes = 0;
+
+						completedMods = 0;
+						completedBytes = 0;
+
+						name = null;
+						task = null;
+
+						hideTimeout = setTimeout(() => {
+							shown = false;
+
+							shownProgress.set(0, { delay: 50, duration: 0 });
+
+							hideTimeout = null;
+						}, 100);
+					}, hideDelay);
+
+					break;
+
+				case 'addCount':
+					totalMods += event.payload.mods;
+					totalBytes += event.payload.bytes;
+
+					shownProgress.set(progress, { duration: 0 });
+
+					if (event.payload.mods > 0) {
+						open = true;
+					}
+					break;
+
+				case 'addProgress':
+					completedMods += event.payload.mods;
+					completedBytes += event.payload.bytes;
+					break;
+
+				case 'setTask':
+					name = event.payload.name;
+					task = event.payload.task;
+					break;
+			}
+		});
+	});
+
+	onDestroy(() => {
+		unlisten?.();
+	});
+
+	async function cancel() {
+		open = false;
+		showCancel = false;
+		await api.profile.install.cancelAll();
+	}
+</script>
+
+<Popover.Root bind:open>
+	<Popover.Trigger
+		class={[
+			'text-accent-600 dark:hover:bg-primary-800 dark:text-accent-500 hover:bg-primary-200 my-auto rounded-md text-xl',
+			shown && 'p-1.5'
+		]}
+	>
+		{#if shown}
+			<div in:scale={{ start: 2, duration: 250, easing: quadOut }}>
+				<Icon icon="mdi:download" class="animate-pulse" />
+			</div>
+		{/if}
+	</Popover.Trigger>
+	<Popover.Content forceMount>
+		{#snippet child({ wrapperProps, props, open })}
+			<div {...wrapperProps}>
+				{#if open}
+					<div
+						{...props}
+						class="border-primary-300 dark:border-primary-600 dark:bg-primary-800 z-10 w-80 rounded-lg border bg-white px-6 py-4 shadow-xl"
+						in:fly={dropIn}
+						out:fade={dropOut}
+					>
+						<div
+							class="text-primary-700 dark:text-primary-300 flex items-center justify-between font-semibold"
+						>
+							<div>{m.installPopover_content()}({completedMods}/{totalMods})</div>
+							{#if showCancel}
+								<IconButton
+									label={m.installPopover_button()}
+									icon="mdi:cancel"
+									color="red"
+									onclick={cancel}
+								/>
+							{/if}
+						</div>
+
+						{#if task && name}
+							<div class="text-primary-500 dark:text-primary-400 text-sm">
+								{taskText}
+							</div>
+						{/if}
+
+						<Progress.Root
+							value={shownProgress.current}
+							max={1}
+							class="dark:bg-primary-900 bg-primary-200 relative mt-2 h-4 w-full overflow-hidden rounded-full"
+						>
+							<div
+								class="bg-accent-700 absolute top-0 left-0 h-full rounded-l-full"
+								style="width: {shownProgress.current * 100}%"
+							></div>
+						</Progress.Root>
+					</div>
+				{/if}
+			</div>
+		{/snippet}
+	</Popover.Content>
+</Popover.Root>

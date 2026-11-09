@@ -1,0 +1,106 @@
+{
+	"productName": "SleepyMiles Mod Manager",
+	"version": "1.0.0",
+	"identifier": "com.sleepymiles.modmanager",
+	"build": {
+		"beforeBuildCommand": "pnpm run build",
+		"beforeDevCommand": "pnpm run dev",
+		"frontendDist": "../build",
+		"devUrl": "http://localhost:5173"
+	},
+	"bundle": {
+		"active": true,
+		"category": "Game",
+		"copyright": "GPL-3.0. Based on Gale by Kesomannen.",
+		"targets": [
+			"nsis"
+		],
+		"externalBin": [],
+		"createUpdaterArtifacts": true,
+		"shortDescription": "Lethal Company mod manager for Thunderstore and SleepyMiles' mods (based on Gale)",
+		"longDescription": "",
+		"icon": [
+			"icons/32x32.png",
+			"icons/128x128.png",
+			"icons/128x128@2x.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"windows": {
+			"nsis": {
+				"installMode": "currentUser"
+			}
+		},
+		"linux": {
+			"appimage": {
+				"files": {
+					"/usr/share/mime/packages/gale.xml": "../assets/gale-mime.xml"
+				}
+			},
+			"deb": {
+				"files": {
+					"/usr/share/mime/packages/gale.xml": "../assets/gale-mime.xml"
+				}
+			},
+			"rpm": {
+				"files": {
+					"/usr/share/mime/packages/gale.xml": "../assets/gale-mime.xml"
+				}
+			}
+		},
+		"resources": [],
+		"fileAssociations": [
+			{
+				"ext": [
+					"r2z"
+				],
+				"mimeType": "application/x-r2z"
+			}
+		]
+	},
+	"plugins": {
+		"updater": {
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVFRjE0MzNBMUM4OTQxREYKUldUZlFZa2NPa1B4N3VvVzNad2ZDWXVkQ0NPVmpSUzRxVXhVNkJTRm1PZkxIOTFzbno5YUFsMEQK",
+			"endpoints": [
+				"https://github.com/SleepyMiles/SleepyMiles-Mod-Manager/releases/latest/download/latest.json"
+			],
+			"windows": {
+				"installMode": "passive"
+			}
+		},
+		"deep-link": {
+			"desktop": {
+				"schemes": [
+					"ror2mm",
+					"sleepymm"
+				]
+			}
+		}
+	},
+	"app": {
+		"windows": [
+			{
+				"decorations": true,
+				"fullscreen": false,
+				"transparent": false,
+				"resizable": true,
+				"title": "SleepyMiles Mod Manager",
+				"width": 900,
+				"height": 700,
+				"minWidth": 800,
+				"minHeight": 600,
+				"dragDropEnabled": false
+			}
+		],
+		"security": {
+			"csp": "default-src * ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' https://storage.ko-fi.com; font-src https://fonts.gstatic.com",
+			"assetProtocol": {
+				"enable": true,
+				"scope": [
+					"**"
+				]
+			}
+		}
+	},
+	"mainBinaryName": "SleepyMilesModManager"
+}

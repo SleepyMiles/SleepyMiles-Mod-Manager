@@ -1,0 +1,421 @@
+use std::{
+    collections::HashMap,
+    fs,
+    ops::Deref,
+    path::{Path, PathBuf},
+};
+
+use eyre::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+use tracing::{debug, info, warn};
+
+use crate::{
+    db::{self, Db},
+    game::{self, Game, platform::Platform},
+    logger,
+    profile::launch::LaunchMode,
+    state::ManagerExt,
+    thunderstore::Backend,
+    util::{
+        self,
+        error::IoResultExt,
+        fs::{Overwrite, UseLinks},
+        window::WindowExt,
+    },
+};
+
+pub mod commands;
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq)]
+#[serde(transparent)]
+pub struct DirPref {
+    value: PathBuf,
+    #[serde(skip)]
+    keep_files: Vec<&'static str>,
+}
+
+impl DirPref {
+    fn new(value: PathBuf) -> Self {
+        Self {
+            value,
+            keep_files: Vec::new(),
+        }
+    }
+
+    fn keep(mut self, file: &'static str) -> Self {
+        self.keep_files.push(file);
+        self
+    }
+
+    pub fn get(&self) -> &Path {
+        &self.value
+    }
+
+    pub fn set(&mut self, new_value: PathBuf) -> Result<bool> {
+        if self.value == new_value {
+            return Ok(false);
+        }
+
+        ensure!(new_value.is_dir(), "new value is not a directory");
+        ensure!(
+            !new_value.starts_with(&self.value),
+            "value cannot be a subdirectory of the current directory"
+        );
+        ensure!(
+            new_value.read_dir()?.next().is_none(),
+            "new directory is not empty"
+        );
+
+        info!(
+            "attempting to rename directory: {} -> {}",
+            self.value.display(),
+            new_value.display()
+        );
+
+        // on windows fs::rename requires the target directory to not exist
+        #[cfg(windows)]
+        fs::remove_dir(&new_value)?;
+
+        match fs::rename(&self.value, &new_value) {
+            Ok(()) => {
+                info!("renaming succeeded");
+
+                if !self.keep_files.is_empty() {
+                    // move files back to the original directory
+                    fs::create_dir_all(&self.value)?;
+
+                    for file in &self.keep_files {
+                        let moved_path = new_value.join(file);
+                        let original_path = self.value.join(file);
+
+                        if !moved_path.exists() {
+                            continue;
+                        }
+
+                        if moved_path.is_dir() {
+                            util::fs::copy_dir(
+                                &moved_path,
+                                &original_path,
+                                Overwrite::Yes,
+                                UseLinks::No,
+                            )?;
+                        } else {
+                            fs::copy(&moved_path, &original_path)?;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                info!("renaming failed, falling back to copying: {}", err);
+
+                fs::create_dir_all(&new_value).fs_context("creating new directory", &new_value)?;
+
+                for entry in self
+                    .value
+                    .read_dir()
+                    .fs_context("reading old directory", &self.value)?
+                {
+                    let entry = entry.context("failed to read file in old directory")?;
+                    let file_name = entry.file_name();
+
+                    if self.keep_files.iter().any(|file| file_name == *file) {
+                        info!("skipping {}", file_name.to_string_lossy());
+                        continue;
+                    }
+
+                    let old_path = entry.path();
+                    let new_path = new_value.join(file_name);
+
+                    if entry.file_type()?.is_dir() {
+                        debug!("copying dir {:?} -> {:?}", old_path, new_path);
+
+                        util::fs::copy_dir(&old_path, &new_path, Overwrite::Yes, UseLinks::No)
+                            .context("failed to copy subdirectory")?;
+                        fs::remove_dir_all(&old_path)
+                            .fs_context("removing old subdirectory", &old_path)?;
+                    } else {
+                        debug!("copying file {:?} -> {:?}", old_path, new_path);
+
+                        fs::copy(&old_path, &new_path).fs_context("copying file", &new_path)?;
+                        fs::remove_file(&old_path).fs_context("removing old file", &old_path)?;
+                    }
+                }
+            }
+        }
+
+        // remove only if empty
+        fs::remove_dir(&self.value).ok();
+
+        self.value = new_value;
+
+        Ok(true)
+    }
+}
+
+impl AsRef<Path> for DirPref {
+    fn as_ref(&self) -> &Path {
+        self.get()
+    }
+}
+
+impl Deref for DirPref {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl PartialEq for DirPref {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl From<PathBuf> for DirPref {
+    fn from(value: PathBuf) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Prefs {
+    pub data_dir: DirPref,
+
+    pub fetch_mods_automatically: bool,
+    pub zoom_factor: f32,
+    pub pull_before_launch: bool,
+    pub language: String,
+    pub backend_skip_confirm: bool,
+
+    pub game_prefs: HashMap<String, GamePrefs>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub enum Backends {
+    #[default]
+    All,
+    Thunderstore,
+    SleepyMiles,
+}
+
+impl Backends {
+    pub fn iter(&self) -> impl Iterator<Item = Backend> {
+        match self {
+            Backends::All => [Backend::Thunderstore, Backend::SleepyMiles].iter(),
+            Backends::Thunderstore => [Backend::Thunderstore].iter(),
+            Backends::SleepyMiles => [Backend::SleepyMiles].iter(),
+        }
+        .copied()
+    }
+}
+
+impl From<Backend> for Backends {
+    fn from(value: Backend) -> Self {
+        match value {
+            Backend::Thunderstore => Backends::Thunderstore,
+            Backend::SleepyMiles => Backends::SleepyMiles,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GamePrefs {
+    pub dir_override: Option<PathBuf>,
+    // Older versions used to have a list of arguments instead of one string
+    // this is hard to migrate in SQL due to the nested JSON structure, so we
+    // support both formats in deserialization and convert to the new format
+    #[serde(deserialize_with = "string_or_vec")]
+    pub custom_args: String,
+    pub launch_mode: LaunchMode,
+    pub platform: Option<Platform>,
+    pub show_steam_launch_options: bool,
+    pub backend: Backends,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            data_dir: DirPref::new(util::path::default_app_data_dir())
+                .keep(logger::FILE_NAME)
+                .keep(db::FILE_NAME)
+                .keep(db::SHM_FILE_NAME)
+                .keep(db::WAL_FILE_NAME)
+                .keep(game::CACHE_FILE_NAME),
+
+            fetch_mods_automatically: true,
+            pull_before_launch: true,
+
+            zoom_factor: 1.0,
+            language: "en".to_string(),
+            backend_skip_confirm: false,
+
+            game_prefs: HashMap::new(),
+        }
+    }
+}
+
+impl Prefs {
+    pub fn init(&mut self, db: &Db, app: &AppHandle) -> Result<()> {
+        self.data_dir.keep_files.extend(&[
+            logger::FILE_NAME,
+            db::FILE_NAME,
+            db::SHM_FILE_NAME,
+            db::WAL_FILE_NAME,
+            game::CACHE_FILE_NAME,
+        ]);
+
+        let window = app.get_webview_window("main").unwrap();
+        window.zoom(f64::from(self.zoom_factor)).ok();
+
+        self.save(db)?;
+
+        Ok(())
+    }
+
+    fn save(&self, db: &Db) -> Result<()> {
+        db.save_prefs(self)
+    }
+
+    fn set(&mut self, value: Self, app: &AppHandle) -> Result<()> {
+        self.game_prefs = value.game_prefs;
+        self.validate_game_prefs()?;
+
+        if self.data_dir != value.data_dir {
+            // move profile paths
+            let mut manager = app.lock_manager();
+
+            let mut path = value.data_dir.to_path_buf();
+            for (key, game) in &mut manager.games {
+                path.push(&*key.slug);
+
+                game.path = path.clone();
+
+                path.push("profiles");
+
+                for profile in &mut game.profiles {
+                    profile.path = path.join(&profile.name);
+                }
+
+                path.pop();
+                path.pop();
+            }
+
+            manager.save_all(app)?;
+        }
+
+        self.data_dir.set(value.data_dir.value)?;
+
+        if self.zoom_factor != value.zoom_factor {
+            let window = app.get_webview_window("main").unwrap();
+            window
+                .zoom(f64::from(value.zoom_factor))
+                .context("failed to set zoom level")?;
+        }
+        self.zoom_factor = value.zoom_factor;
+        self.language = value.language;
+
+        self.fetch_mods_automatically = value.fetch_mods_automatically;
+        self.pull_before_launch = value.pull_before_launch;
+        self.backend_skip_confirm = value.backend_skip_confirm;
+
+        self.save(app.db()).context("failed save prefs")
+    }
+
+    fn validate_game_prefs(&mut self) -> Result<()> {
+        for (slug, value) in &mut self.game_prefs {
+            let Some(game) = game::from_slug(slug) else {
+                warn!("game prefs key {} is invalid", slug);
+                continue;
+            };
+
+            if let Some(platform) = game.platforms.iter().next() {
+                value.platform.get_or_insert(platform);
+            } else {
+                value.platform = None;
+                if let LaunchMode::Launcher = value.launch_mode {
+                    value.launch_mode = LaunchMode::Direct {
+                        instances: 1,
+                        interval_secs: 10.0,
+                    };
+                }
+            }
+
+            // make sure people don't select the steam library
+            if value.dir_override.as_ref().is_some_and(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy().to_lowercase();
+                    name.contains("steam") || name.contains("common") || name.contains("steamapps")
+                })
+            }) {
+                value.dir_override = None;
+                bail!(
+                    "Location override for {} is invalid. Please ensure you selected the game's directory.",
+                    slug
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        self.data_dir.join("cache")
+    }
+
+    pub fn enabled_backends(&self, game: Game) -> Backends {
+        match game.backends.as_slice() {
+            [backend] => (*backend).into(),
+            _ => self
+                .game_prefs
+                .get(&*game.slug)
+                .map(|p| p.backend)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn string_or_vec<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrVec {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("string, list of strings or null")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut args = Vec::new();
+            while let Some(arg) = seq.next_element::<String>()? {
+                args.push(arg);
+            }
+            Ok(args.join(" "))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(String::new())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}

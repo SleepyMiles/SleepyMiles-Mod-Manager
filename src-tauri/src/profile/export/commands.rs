@@ -1,0 +1,298 @@
+use std::{
+    collections::HashSet,
+    fs,
+    io::{BufWriter, Cursor},
+    path::PathBuf,
+};
+
+use eyre::{Context, eyre};
+use itertools::Itertools;
+use serde::Serialize;
+use tauri::{AppHandle, command};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tracing::{debug, info, warn};
+
+use super::{
+    changelog,
+    modpack::{self, ModpackArgs},
+};
+use crate::{
+    profile::{
+        ProfileModKind,
+        export::{ExportFile, ExportedCode},
+    },
+    state::ManagerExt,
+    thunderstore::{self, UploadSubmissionResult},
+    util::{cmd::Result, error::IoResultExt},
+};
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum ExportCodeReport {
+    Success(ExportedCode),
+    TooLarge { size: usize },
+}
+
+#[command]
+pub async fn export_code(app: AppHandle) -> Result<ExportCodeReport> {
+    info!("exporting profile code");
+    match super::export_code(&app).await {
+        Ok(code) => Ok(ExportCodeReport::Success(code)),
+        Err(super::ExportCodeError::TooLarge { size }) => Ok(ExportCodeReport::TooLarge { size }),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[command]
+pub async fn export_file(dir: PathBuf, app: AppHandle) -> Result<()> {
+    let (export_path, profile_id) = {
+        let manager = app.lock_manager();
+
+        let profile = manager.active_profile();
+
+        let mut path = dir;
+        path.push(&profile.name);
+        path.set_extension("r2z");
+
+        (path, profile.id)
+    };
+
+    let file = fs::File::create(&export_path).map_err(|err| eyre!(err))?;
+
+    let writer = BufWriter::new(file);
+    super::export_zip(&app, profile_id, writer).await?;
+
+    open::that_detached(export_path.parent().unwrap()).ok();
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModpackInfo {
+    args: ModpackArgs,
+    sleepymiles_exclusive: bool,
+}
+
+#[command]
+pub fn get_pack_args(app: AppHandle) -> Result<Option<ModpackInfo>> {
+    let mut manager = app.lock_manager();
+
+    let game = manager.active_game;
+    let profile = manager.active_profile_mut();
+
+    let sleepymiles_exclusive = modpack::refresh_args(profile, &app.lock_thunderstore(), game);
+
+    Ok(profile.modpack.clone().map(|args| ModpackInfo {
+        args,
+        sleepymiles_exclusive,
+    }))
+}
+
+#[command]
+pub fn set_pack_args(args: ModpackArgs, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let profile = manager.active_profile_mut();
+    profile.modpack = Some(args);
+    profile.save(&app, true)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn export_pack(dir: PathBuf, args: ModpackArgs, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    let profile = manager.active_profile_mut();
+
+    let mut path = dir;
+    path.push(format!("{}-{}", args.name, args.version_number));
+    path.add_extension("zip");
+
+    debug!("exporting pack to {:?}", path);
+
+    let file = fs::File::create(&path)
+        .map(BufWriter::new)
+        .context("failed to create file")?;
+    profile.export_pack(&args, file, &thunderstore)?;
+
+    debug!("taking snapshot of profile");
+
+    if let Err(err) = profile.take_snapshot(&args) {
+        warn!("failed to take profile snapshot: {}", err);
+    }
+
+    open::that_detached(path).ok();
+
+    Ok(())
+}
+
+#[command]
+pub async fn upload_pack(args: ModpackArgs, app: AppHandle) -> Result<UploadSubmissionResult> {
+    let (data, game, args, token) = {
+        let manager = app.lock_manager();
+        let thunderstore = app.lock_thunderstore();
+
+        let profile = manager.active_profile();
+
+        let token = thunderstore::token::get(args.backend)
+            .context("failed to get thunderstore API token")?
+            .ok_or(eyre!("no thunderstore API token found"))?;
+
+        let mut data = Cursor::new(Vec::new());
+        profile.export_pack(&args, &mut data, &thunderstore)?;
+
+        if let Err(err) = profile.take_snapshot(&args) {
+            warn!("failed to take profile snapshot: {}", err);
+        }
+
+        (data, manager.active_game, args, token)
+    };
+
+    Ok(modpack::publish(&app, data.into_inner().into(), game, args, token).await?)
+}
+
+#[command]
+pub fn copy_dependency_strings(app: AppHandle) -> Result<()> {
+    let str = concat_dependency_strings(&app);
+
+    app.clipboard()
+        .write_text(str)
+        .context("failed to write to clipboard")?;
+
+    Ok(())
+}
+
+#[command]
+pub fn export_dependency_strings(app: AppHandle, directory: PathBuf) -> Result<()> {
+    let str = concat_dependency_strings(&app);
+
+    let name = {
+        let manager = app.lock_manager();
+        manager.active_profile().name.clone()
+    };
+
+    let path = directory.join(name).with_extension("txt");
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).fs_context("creating parent directory", parent)?;
+    }
+
+    fs::write(&path, str).fs_context("writing mod list file", &directory)?;
+    open::that_detached(&path).fs_context("opening mod list file", &directory)?;
+
+    Ok(())
+}
+
+fn concat_dependency_strings(app: &AppHandle) -> String {
+    let manager = app.lock_manager();
+
+    manager
+        .active_profile()
+        .mods
+        .iter()
+        .map(|profile_mod| profile_mod.ident())
+        .join("\n")
+}
+
+#[command]
+pub fn copy_debug_info(app: AppHandle) -> Result<()> {
+    let manager = app.lock_manager();
+    let profile = manager.active_profile();
+
+    let log = profile
+        .log_path()
+        .and_then(|path| fs::read_to_string(path).map_err(|err| eyre!(err)));
+
+    let mods = profile
+        .mods
+        .iter()
+        .map(|profile_mod| {
+            let source = match &profile_mod.kind {
+                ProfileModKind::Thunderstore(ts_mod) => &ts_mod.id.backend.to_string(),
+                ProfileModKind::Local(_) => "local",
+            };
+
+            let ident = profile_mod.ident();
+
+            format!(
+                "{} by {} v{} [{}]",
+                ident.name(),
+                ident.owner(),
+                ident.version(),
+                source
+            )
+        })
+        .sorted()
+        .join("\n");
+
+    let content = format!(
+        "OS: {}\nGale version: {}\n\nMods ({}):\n{}\n\nLatest log:\n{}",
+        std::env::consts::OS,
+        env!("CARGO_PKG_VERSION"),
+        profile.mods.len(),
+        mods,
+        match log {
+            Ok(log) => log,
+            Err(err) => format!("failed to read log: {err}"),
+        }
+    );
+
+    app.clipboard()
+        .write_text(content)
+        .context("failed to write to clipboard")?;
+
+    Ok(())
+}
+
+#[command]
+pub fn generate_changelog(mut args: ModpackArgs, all: bool, app: AppHandle) -> Result<String> {
+    let manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    if all {
+        let changelog = changelog::generate_all(
+            &args,
+            manager.active_profile(),
+            manager.active_game().game,
+            &thunderstore,
+        )?;
+
+        Ok(changelog)
+    } else {
+        changelog::generate_latest(
+            &mut args,
+            manager.active_profile(),
+            manager.active_game().game,
+            &thunderstore,
+        )?;
+
+        Ok(args.changelog)
+    }
+}
+
+#[command]
+pub fn list_export_files(app: AppHandle) -> Result<Vec<ExportFile>> {
+    let mut manager = app.lock_manager();
+    let profile = manager.active_profile_mut();
+
+    super::refresh_excluded_export_files(profile)?;
+    profile.save(&app, false)?;
+
+    let files = super::list_export_files(profile).collect::<eyre::Result<Vec<_>>>()?;
+
+    Ok(files)
+}
+
+#[command]
+pub fn set_excluded_export_files(app: AppHandle, excluded_files: HashSet<PathBuf>) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let profile = manager.active_profile_mut();
+
+    profile.excluded_export_files = excluded_files;
+    profile.save(&app, false)?;
+
+    Ok(())
+}

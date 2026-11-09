@@ -1,0 +1,98 @@
+# Builds the Windows installer and publishes a GitHub Release with the auto-update files.
+#
+# To release: Actions tab -> "Release" -> Run workflow -> type the new version (e.g. 1.0.1).
+# (Pushing a tag like v1.0.1 also works.)
+#
+# Needs one repository secret: TAURI_SIGNING_PRIVATE_KEY (the updater signing key).
+name: Release
+run-name: Release ${{ inputs.version || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, like 1.0.1
+        required: true
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          v="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must look like 1.0.1 (got '$v')."
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          # The app reads its version from tauri.conf.json.
+          node -e "const f='src-tauri/tauri.conf.json';const fs=require('fs');const c=JSON.parse(fs.readFileSync(f));c.version='$v';fs.writeFileSync(f,JSON.stringify(c,null,'\t')+'\n')"
+
+      - name: Check the signing key is set up
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is missing. Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          tagName: v${{ steps.version.outputs.version }}
+          releaseName: SleepyMiles Mod Manager ${{ steps.version.outputs.version }}
+          releaseBody: |
+            Download **SleepyMiles.Mod.Manager_${{ steps.version.outputs.version }}_x64-setup.exe** below and run it.
+            Already installed? The app updates itself.
+
+            See CHANGELOG.md for what changed.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true

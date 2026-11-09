@@ -1,0 +1,68 @@
+<script lang="ts">
+	import { clearToast, pushInfoToast, toasts, type Toast } from '$lib/toast';
+	import Icon from '@iconify/svelte';
+	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+	import clsx from 'clsx';
+	import { expoOut } from 'svelte/easing';
+	import { fade, slide } from 'svelte/transition';
+	import IconButton from '../ui/IconButton.svelte';
+	import { m } from '$lib/paraglide/messages';
+
+	async function copyError(toast: Toast) {
+		await writeText(`${toast.name ? `${toast.name}: ` : ''}${toast.message}`);
+		pushInfoToast({
+			message: m.toasts_copyError_message()
+		});
+	}
+</script>
+
+<div class="absolute bottom-0 z-50 flex w-full flex-col items-end gap-1 p-2">
+	{#each $toasts as toast, i (toast.id)}
+		<div
+			class="border-primary-200 dark:bg-primary-800 dark:border-primary-700 relative max-w-3xl overflow-hidden rounded-md border bg-white shadow-xl"
+			in:slide={{ duration: 150, easing: expoOut }}
+			out:fade={{ duration: 50 }}
+		>
+			<div
+				class={[
+					toast.type === 'error' ? 'bg-red-600' : 'bg-accent-700',
+					'absolute left-0 h-full w-1.5'
+				]}
+			></div>
+
+			<div class="flex items-center p-2">
+				<Icon
+					class={clsx(
+						toast.type === 'error' ? 'text-red-600' : 'text-accent-600',
+						'mx-2 shrink-0 text-xl'
+					)}
+					icon={toast.type === 'error' ? 'mdi:error' : 'mdi:check-circle'}
+				/>
+
+				<div class="mr-4 grow overflow-hidden">
+					{#if toast.name}
+						<span class="text-primary-600 dark:text-primary-300">{toast.name}:</span>
+					{/if}
+
+					<span class="text-primary-900 dark:text-primary-100 font-medium wrap-break-word"
+						>{toast.message}</span
+					>
+				</div>
+
+				{#if toast.type === 'error'}
+					<IconButton
+						icon="mdi:content-copy"
+						label={m.toasts_button_copy()}
+						onclick={() => copyError(toast)}
+					/>
+				{/if}
+
+				<IconButton
+					icon="mdi:close"
+					label={m.toasts_button_clear()}
+					onclick={() => clearToast(i)}
+				/>
+			</div>
+		</div>
+	{/each}
+</div>

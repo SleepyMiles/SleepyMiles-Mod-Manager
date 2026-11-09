@@ -1,0 +1,564 @@
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+use eyre::{Context, OptionExt, eyre};
+use itertools::Itertools;
+use serde::Serialize;
+use tauri::{AppHandle, command};
+use tracing::warn;
+use uuid::Uuid;
+
+use super::{Dependant, Profile, actions::ActionResult};
+use crate::{
+    game::{self, Game, platform::Platform},
+    profile::{FrontendManagedGame, query::FrontendProfileMod},
+    state::ManagerExt,
+    thunderstore::{
+        Backend, BorrowedMod, FromBackend, ModId, Thunderstore, VersionIdent, cache::MarkdownKind,
+        query::QueryModsArgs,
+    },
+    util::cmd::Result,
+};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendGame {
+    name: &'static str,
+    slug: &'static str,
+    popular: bool,
+    mod_loader: &'static str,
+    platforms: Vec<Platform>,
+    backends: Vec<Backend>,
+}
+
+impl From<Game> for FrontendGame {
+    fn from(value: Game) -> Self {
+        let platforms = value.platforms.iter().collect();
+
+        Self {
+            name: value.name,
+            slug: &*value.slug,
+            popular: value.popular,
+            mod_loader: value.mod_loader.as_str(),
+            platforms,
+            backends: value.backends.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameInfo {
+    all: Vec<FrontendGame>,
+    last_updated: DateTime<Utc>,
+    active: FrontendGame,
+    favorites: Vec<&'static str>,
+}
+
+#[command]
+pub fn get_game_info(app: AppHandle) -> GameInfo {
+    let manager = app.lock_manager();
+
+    let favorites = manager
+        .games
+        .iter()
+        .filter_map(|(game, managed_game)| {
+            if managed_game.favorite {
+                Some(&*game.slug)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    GameInfo {
+        all: game::list().map_into().collect(),
+        last_updated: game::last_updated(),
+        active: manager.active_game.into(),
+        favorites,
+    }
+}
+
+#[command]
+pub fn favorite_game(slug: String, app: AppHandle) -> Result<()> {
+    let prefs = app.lock_prefs();
+    let mut manager = app.lock_manager();
+
+    let game = game::from_slug(&slug).ok_or_eyre("unknown game")?;
+    let managed_game = manager.ensure_game(game, false, &prefs, app.db())?;
+    managed_game.favorite = !managed_game.favorite;
+
+    managed_game.save(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn set_active_game(slug: &str, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let game = game::from_slug(slug).ok_or_eyre("unknown game")?;
+
+    app.sync_socket().unsubscribe(manager.active_profile());
+
+    let managed_game = manager.set_active_game(game, &app)?;
+
+    app.sync_socket().subscribe(managed_game.active_profile());
+
+    managed_game.update_window_title(&app)?;
+    manager.save_all(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn get_profile_info(app: AppHandle) -> FrontendManagedGame {
+    let manager = app.lock_manager();
+
+    manager.active_game().to_frontend()
+}
+
+#[command]
+pub async fn set_active_profile(index: usize, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let game = manager.active_game_mut();
+
+    app.sync_socket().unsubscribe(game.active_profile());
+
+    game.set_active_profile(index)?;
+
+    let profile = game.active_profile_mut();
+
+    if profile.sync.as_ref().is_some_and(|sync| !sync.missing) {
+        let app_clone = app.clone();
+
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = super::sync::pull_profile(true, &app_clone).await {
+                warn!(?err, "failed to refresh sync after profile switch");
+            }
+        });
+    }
+
+    app.sync_socket().subscribe(game.active_profile());
+
+    game.save(&app)?;
+    game.update_window_title(&app)?;
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendAvailableUpdate {
+    full_name: VersionIdent,
+    ignore: bool,
+    updated_id: ModId,
+    old: semver::Version,
+    new: semver::Version,
+    is_cross_backend: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileQuery {
+    mods: Vec<FrontendProfileMod>,
+    total_mod_count: usize,
+    updates: Vec<FrontendAvailableUpdate>,
+    unknown_mods: Vec<Dependant>,
+}
+
+#[command]
+pub fn query_profile(args: QueryModsArgs, app: AppHandle) -> Result<ProfileQuery> {
+    let manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+    let install_queue = app.install_queue().lock();
+
+    let profile = manager.active_profile();
+
+    let (mods, unknown_mods) = profile.query_mods(&args, &thunderstore);
+    let total_mod_count = profile.mods.len();
+
+    let updates = profile
+        .mods
+        .iter()
+        .filter_map(|profile_mod| {
+            profile
+                .check_update(profile_mod.uuid(), &thunderstore, &install_queue)
+                .transpose()
+        })
+        .map_ok(|update| {
+            let ignore = profile.is_update_ignored(&update);
+            let is_cross_backend = update.current.package.backend != update.latest.package.backend;
+
+            FrontendAvailableUpdate {
+                full_name: update.latest.version.ident.clone(),
+                ignore,
+                is_cross_backend,
+                old: update.current.version.parsed_version(),
+                new: update.latest.version.parsed_version(),
+                updated_id: update.latest.into(),
+            }
+        })
+        .collect::<eyre::Result<Vec<_>>>()
+        .unwrap_or_else(|err| {
+            warn!("failed to check for updates: {:#}", err);
+            Vec::new()
+        });
+
+    Ok(ProfileQuery {
+        mods,
+        total_mod_count,
+        updates,
+        unknown_mods,
+    })
+}
+
+#[command]
+pub fn is_mod_installed(uuid: Uuid, app: AppHandle) -> Result<bool> {
+    let manager = app.lock_manager();
+    let profile = manager.active_profile();
+
+    let result = profile.has_mod(uuid) || app.install_queue().lock().has_mod(uuid, profile.id);
+
+    Ok(result)
+}
+
+#[command]
+pub fn create_profile(name: String, override_path: Option<PathBuf>, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    let profile = game.create_profile(name, override_path, app.db())?;
+
+    profile.save(&app, false)?;
+    game.save(&app)?;
+
+    game.update_window_title(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn delete_profile(id: i64, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    game.delete_profile(id, false, app.db())?;
+    game.save(&app)?;
+
+    game.update_window_title(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn rename_profile(name: String, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    let profile = game.active_profile_mut();
+
+    profile.rename(name)?;
+    profile.save(&app, true)?;
+
+    game.update_window_title(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn duplicate_profile(name: String, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    let profile = game.duplicate_profile(name, game.active_profile_id, app.db())?;
+
+    profile.save(&app, false)?;
+    game.save(&app)?;
+
+    game.update_window_title(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn remove_mod(uuid: Uuid, app: AppHandle) -> Result<ActionResult> {
+    mod_action_command(app, |profile, thunderstore| {
+        profile.remove_mod(uuid, thunderstore)
+    })
+}
+
+#[command]
+pub fn toggle_mod(uuid: Uuid, app: AppHandle) -> Result<ActionResult> {
+    mod_action_command(app, |profile, thunderstore| {
+        profile.toggle_mod(uuid, thunderstore)
+    })
+}
+
+fn mod_action_command<F>(app: AppHandle, action: F) -> Result<ActionResult>
+where
+    F: FnOnce(&mut Profile, &Thunderstore) -> eyre::Result<ActionResult>,
+{
+    let mut manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    let profile = manager.active_profile_mut();
+    let response = action(profile, &thunderstore)?;
+
+    if let ActionResult::Done = response {
+        profile.save(&app, true)?;
+    }
+
+    Ok(response)
+}
+
+#[command]
+pub fn force_remove_mods(uuids: Vec<Uuid>, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let profile = manager.active_profile_mut();
+    for package_uuid in uuids {
+        profile.force_remove_mod(package_uuid)?;
+    }
+
+    profile.save(&app, true)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn set_all_mods_state(enable: bool, app: AppHandle) -> Result<usize> {
+    let mut manager = app.lock_manager();
+
+    let profile = manager.active_profile_mut();
+    let uuids = profile
+        .mods
+        .iter()
+        .filter(|profile_mod| profile_mod.enabled != enable)
+        .map(super::ProfileMod::uuid)
+        .collect_vec();
+
+    let count = uuids.len();
+
+    for uuid in uuids {
+        profile.force_toggle_mod(uuid)?;
+    }
+
+    profile.save(&app, true)?;
+
+    Ok(count)
+}
+
+#[command]
+pub fn remove_disabled_mods(app: AppHandle) -> Result<usize> {
+    let mut manager = app.lock_manager();
+
+    let profile = manager.active_profile_mut();
+    let uuids = profile
+        .mods
+        .iter()
+        .filter(|profile_mod| !profile_mod.enabled)
+        .map(super::ProfileMod::uuid)
+        .collect_vec();
+
+    let len = uuids.len();
+
+    for uuid in uuids {
+        profile.force_remove_mod(uuid)?;
+    }
+
+    profile.save(&app, true)?;
+
+    Ok(len)
+}
+
+#[command]
+pub fn force_toggle_mods(uuids: Vec<Uuid>, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let profile = manager.active_profile_mut();
+    for package_uuid in uuids {
+        profile.force_toggle_mod(package_uuid)?;
+    }
+
+    profile.save(&app, true)?;
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependantWithVersion {
+    #[serde(rename = "fullName")]
+    ident: VersionIdent,
+    preferred_version: Option<String>,
+}
+
+#[command]
+pub fn get_dependants(uuid: Uuid, app: AppHandle) -> Result<Vec<DependantWithVersion>> {
+    let manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    let target_mod = manager.active_profile().get_mod(uuid)?;
+
+    let dependants = manager
+        .active_profile()
+        .dependants(uuid, &thunderstore)
+        .map(|profile_mod| {
+            let preferred_version =
+                profile_mod
+                    .direct_dependencies(&thunderstore)
+                    .and_then(|direct_deps| {
+                        direct_deps
+                            .iter()
+                            .find(|dep_ident| {
+                                dep_ident.full_name() == target_mod.ident().full_name()
+                            })
+                            .map(|ident| ident.version().to_string())
+                    });
+            let ident = profile_mod.ident().into_owned();
+
+            DependantWithVersion {
+                ident,
+                preferred_version,
+            }
+        })
+        .collect();
+
+    Ok(dependants)
+}
+
+#[command]
+pub fn open_profile_dir(app: AppHandle) -> Result<()> {
+    let manager = app.lock_manager();
+
+    let path = &manager.active_profile().path;
+    open::that_detached(path).context("failed to open directory")?;
+
+    Ok(())
+}
+
+#[command]
+pub fn open_mod_dir(uuid: Uuid, app: AppHandle) -> Result<()> {
+    let manager = app.lock_manager();
+
+    manager.active_profile().open_mod_dir(uuid)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn open_game_log(app: AppHandle) -> Result<()> {
+    let manager = app.lock_manager();
+
+    let path = manager.active_profile().log_path()?;
+    open::that_detached(path).context("failed to open log file")?;
+
+    Ok(())
+}
+
+#[command]
+pub fn create_desktop_shortcut(app: AppHandle) -> Result<()> {
+    let manager = app.lock_manager();
+
+    manager.active_game().create_desktop_shortcut()?;
+
+    Ok(())
+}
+
+#[command]
+pub async fn get_local_markdown(
+    uuid: Uuid,
+    kind: MarkdownKind,
+    app: AppHandle,
+) -> Result<Option<String>> {
+    let manager = app.lock_manager();
+    let profile = manager.active_profile();
+
+    let local_mod = profile.get_mod(uuid).and_then(|profile_mod| {
+        profile_mod
+            .as_local()
+            .map(|(local_mod, _)| local_mod)
+            .ok_or_eyre("mod is not local")
+    })?;
+
+    let str = match kind {
+        MarkdownKind::Readme => &local_mod.readme,
+        MarkdownKind::Changelog => &local_mod.changelog,
+    };
+
+    Ok(str.clone())
+}
+
+#[command]
+pub fn set_custom_args(custom_args: String, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let profile = manager.active_profile_mut();
+    profile.custom_args = custom_args;
+    profile.save(&app, false)?;
+    manager.save_active_game(&app)?;
+    Ok(())
+}
+
+#[command]
+pub fn set_profile_path(new_path: PathBuf, profile_id: i64, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    if !new_path.is_dir() {
+        return Err(eyre!("provided path is not a directory").into());
+    }
+
+    let profile = game.profile_mut(profile_id)?;
+    profile.path = new_path;
+    profile.missing = false;
+
+    profile.save(&app, true)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn forget_profile(profile_id: i64, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let game = manager.active_game_mut();
+
+    game.forget_profile(profile_id, app.db())?;
+
+    game.save(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn toggle_hidden_mod(uuid: Uuid, app: AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    if manager.hidden_mods.contains(&uuid) {
+        manager.hidden_mods.remove(&uuid);
+    } else {
+        manager.hidden_mods.insert(uuid);
+    }
+
+    manager.save(&app)?;
+
+    Ok(())
+}
+
+#[command]
+pub fn get_hidden_mods(app: AppHandle) -> Result<Vec<Dependant>> {
+    let manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    let hidden_mods = manager
+        .hidden_mods
+        .iter()
+        .filter_map(|uuid| {
+            let package = thunderstore.get_package(*uuid, FromBackend::Any).ok()?;
+            Some(Dependant::from(BorrowedMod::latest(package)))
+        })
+        .collect();
+
+    Ok(hidden_mods)
+}

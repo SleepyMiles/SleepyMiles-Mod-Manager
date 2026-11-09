@@ -1,0 +1,234 @@
+use std::env;
+
+use itertools::Itertools;
+use state::ManagerExt;
+use tauri::{App, AppHandle, RunEvent};
+use tauri_plugin_deep_link::DeepLinkExt;
+use tracing::{debug, error, info, warn};
+
+mod cli;
+mod config;
+mod db;
+mod deep_link;
+mod events;
+mod game;
+mod logger;
+mod prefs;
+mod profile;
+mod state;
+mod thunderstore;
+mod util;
+
+fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        os = std::env::consts::OS,
+    );
+
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        warn!(?err, "failed to install aws_lc_rs default crypto provider");
+    }
+
+    if let Err(err) = state::setup(app.handle()) {
+        error!("setup error: {err:?}");
+
+        // Linux dialog often won't work before the event loop starts and instead hangs the application
+        #[cfg(target_os = "windows")]
+        {
+            use tauri_plugin_dialog::DialogExt;
+
+            app.dialog()
+                .message(format!("Failed to launch Gale: {err:?}"))
+                .blocking_show();
+        }
+
+        return Err(err.into());
+    }
+
+    if let Err(err) = app.deep_link().register("ror2mm") {
+        warn!("failed to register ror2mm deep link protocol: {:#}", err);
+    }
+
+    if let Err(err) = app.deep_link().register("gale") {
+        warn!("failed to register gale deep link protocol: {:#}", err);
+    }
+
+    let args = env::args().collect_vec();
+    if let Some(url) = args.get(1)
+        && !deep_link::handle(app.handle(), url.to_owned())
+    {
+        cli::run(args, app.handle());
+    }
+
+    let handle = app.handle().to_owned();
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = game::update_list_task(&handle).await {
+            warn!("failed to update games list: {err}");
+        }
+    });
+
+    info!("setup done");
+
+    Ok(())
+}
+
+fn event_handler(app: &AppHandle, event: RunEvent) {
+    if let RunEvent::ExitRequested { api, .. } = event {
+        if !app.install_queue().lock().is_processing() {
+            return;
+        }
+
+        api.prevent_exit();
+
+        tauri::async_runtime::spawn(profile::install::handle_exit(app.to_owned()));
+    }
+}
+
+fn handle_single_instance(app: &AppHandle, args: Vec<String>, _cwd: String) {
+    let Some(url) = args.get(1) else {
+        debug!("deep link has too few arguments");
+        return;
+    };
+
+    if !deep_link::handle(app, url.to_owned()) {
+        cli::run(args, app);
+    }
+}
+
+#[tauri::command]
+fn is_flatpak() -> bool {
+    util::flatpak::is_flatpak()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "tauri's generate_handler macro cannot be split"
+)]
+pub fn run() {
+    logger::setup().unwrap_or_else(|err| {
+        eprintln!("failed to set up logger: {err:#}");
+    });
+
+    // SAFETY: no other threads have been spawned yet
+    #[cfg(target_os = "linux")]
+    unsafe {
+        util::webkit::apply_workarounds();
+    }
+
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            is_flatpak,
+            logger::open_gale_log,
+            logger::log_err,
+            state::is_first_run,
+            thunderstore::commands::query_thunderstore,
+            thunderstore::commands::stop_querying_thunderstore,
+            thunderstore::commands::get_markdown,
+            thunderstore::commands::set_api_token,
+            thunderstore::commands::has_api_token,
+            thunderstore::commands::clear_api_token,
+            thunderstore::commands::trigger_mod_fetch,
+            thunderstore::commands::get_categories,
+            prefs::commands::get_prefs,
+            prefs::commands::set_prefs,
+            prefs::commands::zoom_window,
+            prefs::commands::get_system_fonts,
+            prefs::commands::get_system_accent_color,
+            profile::commands::get_game_info,
+            profile::commands::favorite_game,
+            profile::commands::set_active_game,
+            profile::commands::get_profile_info,
+            profile::commands::set_active_profile,
+            profile::commands::is_mod_installed,
+            profile::commands::query_profile,
+            profile::commands::get_dependants,
+            profile::commands::create_profile,
+            profile::commands::delete_profile,
+            profile::commands::rename_profile,
+            profile::commands::duplicate_profile,
+            profile::commands::remove_mod,
+            profile::commands::force_remove_mods,
+            profile::commands::toggle_mod,
+            profile::commands::force_toggle_mods,
+            profile::commands::set_all_mods_state,
+            profile::commands::remove_disabled_mods,
+            profile::commands::open_profile_dir,
+            profile::commands::open_mod_dir,
+            profile::commands::open_game_log,
+            profile::commands::create_desktop_shortcut,
+            profile::commands::get_local_markdown,
+            profile::commands::set_custom_args,
+            profile::commands::set_profile_path,
+            profile::commands::forget_profile,
+            profile::commands::toggle_hidden_mod,
+            profile::commands::get_hidden_mods,
+            profile::launch::commands::launch_game,
+            profile::launch::commands::get_launch_args,
+            profile::launch::commands::open_game_dir,
+            profile::launch::commands::get_steam_launch_options,
+            profile::install::commands::install_mod,
+            profile::install::commands::cancel_all_installs,
+            profile::install::commands::has_pending_installations,
+            profile::install::commands::is_installing,
+            profile::install::commands::clear_download_cache,
+            profile::install::commands::get_download_size,
+            profile::update::commands::change_mod_version,
+            profile::update::commands::update_mods,
+            profile::update::commands::ignore_update,
+            profile::update::commands::ignore_package_updates,
+            profile::update::commands::resume_updates,
+            profile::import::commands::import_profile,
+            profile::import::commands::read_profile_code,
+            profile::import::commands::read_profile_file,
+            profile::import::commands::read_profile_base64,
+            profile::import::commands::import_local_mod,
+            profile::import::commands::import_local_mod_base64,
+            profile::import::commands::get_r2modman_info,
+            profile::import::commands::import_r2modman,
+            profile::export::commands::export_code,
+            profile::export::commands::export_file,
+            profile::export::commands::export_pack,
+            profile::export::commands::upload_pack,
+            profile::export::commands::get_pack_args,
+            profile::export::commands::set_pack_args,
+            profile::export::commands::generate_changelog,
+            profile::export::commands::copy_dependency_strings,
+            profile::export::commands::export_dependency_strings,
+            profile::export::commands::copy_debug_info,
+            profile::export::commands::list_export_files,
+            profile::export::commands::set_excluded_export_files,
+            profile::sync::commands::read_sync_profile,
+            profile::sync::commands::create_sync_profile,
+            profile::sync::commands::disconnect_sync_profile,
+            profile::sync::commands::delete_sync_profile,
+            profile::sync::commands::push_sync_profile,
+            profile::sync::commands::clone_sync_profile,
+            profile::sync::commands::pull_sync_profile,
+            profile::sync::commands::fetch_sync_profile,
+            profile::sync::commands::set_sync_preserve_extras,
+            profile::sync::commands::get_owned_sync_profiles,
+            profile::sync::commands::login,
+            profile::sync::commands::logout,
+            profile::sync::commands::get_user,
+            config::commands::get_config_files,
+            config::commands::set_config_entry,
+            config::commands::reset_config_entry,
+            config::commands::reset_config_file,
+            config::commands::open_config_file,
+            config::commands::delete_config_file,
+        ])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_single_instance::init(handle_single_instance))
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .setup(setup)
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(event_handler);
+}

@@ -1,0 +1,51 @@
+<script lang="ts">
+	import { open } from '@tauri-apps/plugin-dialog';
+
+	import PathField from '$lib/components/ui/PathField.svelte';
+	import Icon from '@iconify/svelte';
+	import type { Snippet } from 'svelte';
+	import { m } from '$lib/paraglide/messages';
+	import { toSentenceCase } from '$lib/i18n';
+
+	type Props = {
+		label: string;
+		type: 'dir' | 'file';
+		canClear?: boolean;
+		value: string | null;
+		set: (value: string | null) => Promise<void>;
+		children?: Snippet;
+	};
+
+	let { label, type, canClear = false, value = $bindable(), set, children }: Props = $props();
+
+	function browse() {
+		open({
+			defaultPath: value ?? undefined,
+			title: m.pathPref_title({ name: toSentenceCase(label) }),
+			directory: type === 'dir'
+		}).then(async (result) => {
+			if (result === null) return;
+			await set(result);
+			value = result;
+		});
+	}
+</script>
+
+<PathField {label} {value} onclick={browse} icon={type === 'file' ? 'mdi:file' : 'mdi:folder'}>
+	{@render children?.()}
+
+	{#snippet field()}
+		{#if canClear}
+			<button
+				class="text-primary-500 hover:text-primary-700 dark:text-primary-400 dark:hover:bg-primary-800 dark:hover:text-primary-300 hover:bg-primary-200 ml-auto rounded-sm p-1 text-lg"
+				onclick={(evt) => {
+					evt.stopPropagation();
+					value = null;
+					set(null);
+				}}
+			>
+				<Icon icon="mdi:close" />
+			</button>
+		{/if}
+	{/snippet}
+</PathField>

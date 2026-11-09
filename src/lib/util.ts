@@ -1,0 +1,371 @@
+import {
+	Backend,
+	type ConfigEntry,
+	type Game,
+	type MarkdownType,
+	type Mod,
+	ModType,
+	ModLoader,
+	type LaunchOption,
+	type ModId,
+	type Prefs,
+	type RgbaColor,
+	type DeduplicatedMod,
+	type ModContextItem,
+	type ContextItem
+} from './types';
+import { convertFileSrc } from '@tauri-apps/api/core';
+import games from './state/game.svelte';
+import { m } from './paraglide/messages';
+import * as api from '$lib/api';
+import { getLocale } from './paraglide/runtime';
+
+export function shortenFileSize(size: number): string {
+	var i = size == 0 ? 0 : Math.floor(Math.log(size) / Math.log(1024));
+	return (size / Math.pow(1024, i)).toFixed(1) + ['B', 'kB', 'MB', 'GB', 'TB'][i];
+}
+
+export function formatModName(name: string): string {
+	return name.replace(/_/g, ' ');
+}
+
+export function formatLaunchOptionName(game: string, option: LaunchOption): string {
+	switch (option.type) {
+		case 'none':
+		case 'default':
+			return m.steamLaunchOption_default({ game });
+		case 'application':
+			return m.steamLaunchOption_application({ game });
+		case 'safemode':
+			return m.steamLaunchOption_safemode({ game });
+		case 'multiplayer':
+			return m.steamLaunchOption_multiplayer({ game });
+		case 'config':
+			return m.steamLaunchOption_config();
+		case 'vr':
+			return m.steamLaunchOption_vr({ game });
+		case 'server':
+			return m.steamLaunchOption_server();
+		case 'editor':
+			return m.steamLaunchOption_editor();
+		case 'manual':
+			return m.steamLaunchOption_manual();
+		case 'benchmark':
+			return m.steamLaunchOption_benchmark();
+		case 'option1':
+		case 'option2':
+		case 'option3':
+			return option.description
+				? m.steamLaunchOption_option_description({ description: option.description })
+				: m.steamLaunchOption_option_no_description({ game, type: option.type });
+		case 'othervr':
+			return m.steamLaunchOption_othervr({ game });
+		case 'openvroverlay':
+			return m.steamLaunchOption_openvroverlay({ game });
+		case 'osvr':
+			return m.steamLaunchOption_osvr({ game });
+		case 'openxr':
+			return m.steamLaunchOption_openxr({ game });
+		default:
+			if (option.type) {
+				return m.steamLaunchOption_other_with_type({ game, type: option.type });
+			}
+			return m.steamLaunchOption_other({ game });
+	}
+}
+
+export function shortenNum(value: number): string {
+	var i = value == 0 ? 0 : Math.floor(Math.log(value) / Math.log(1000));
+	if (i === 0) {
+		return value.toString();
+	}
+	return (value / Math.pow(1000, i)).toFixed(1) + ['', 'k', 'M', 'G', 'T'][i];
+}
+
+const rtf = new Intl.RelativeTimeFormat(getLocale(), { numeric: 'auto' });
+
+export function timeSince(date: Date | string): string {
+	let seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+
+	let value = Math.floor(seconds / (60 * 60 * 24 * 365.25));
+	if (value > 0) return rtf.format(-value, 'year');
+
+	value = Math.floor(seconds / (60 * 60 * 24 * 30));
+	if (value > 0) return rtf.format(-value, 'month');
+
+	value = Math.floor(seconds / (60 * 60 * 24 * 7));
+	if (value > 0) return rtf.format(-value, 'week');
+
+	value = Math.floor(seconds / (60 * 60 * 24));
+	if (value > 0) return rtf.format(-value, 'day');
+
+	value = Math.floor(seconds / (60 * 60));
+	if (value > 0) return rtf.format(-value, 'hour');
+
+	value = Math.floor(seconds / 60);
+	if (value > 0) return rtf.format(-value, 'minute');
+
+	return m.util_timeSince_interval_null();
+}
+
+export function compareVersions(v1: string, v2: string): number {
+	const v1Parts = v1.split('.').map(Number);
+	const v2Parts = v2.split('.').map(Number);
+
+	for (let i = 0; i < Math.max(v1Parts.length, v2Parts.length); i++) {
+		const part1 = v1Parts[i] ?? 0;
+		const part2 = v2Parts[i] ?? 0;
+
+		if (part1 > part2) return 1;
+		if (part1 < part2) return -1;
+	}
+
+	return 0;
+}
+
+export function getPreferredBackend({ sleepymiles, thunderstore }: DeduplicatedMod<Mod>): Backend {
+	if (sleepymiles && !thunderstore) return Backend.SleepyMiles;
+	if (!sleepymiles && thunderstore) return Backend.Thunderstore;
+
+	if (sleepymiles?.isDeprecated && !thunderstore?.isDeprecated) return Backend.Thunderstore;
+	if (!sleepymiles?.isDeprecated && thunderstore?.isDeprecated) return Backend.SleepyMiles;
+
+	const versionCmp = compareVersions(thunderstore?.version ?? '', sleepymiles?.version ?? '');
+	if (versionCmp > 0) return Backend.Thunderstore;
+	if (versionCmp < 0) return Backend.SleepyMiles;
+
+	return Backend.Thunderstore;
+}
+
+export function extractDeduplicatedMod<T>(
+	deduplicated: DeduplicatedMod<T>,
+	backend: Backend
+): T | null {
+	switch (backend) {
+		case Backend.Thunderstore:
+			return deduplicated.thunderstore;
+		case Backend.SleepyMiles:
+			return deduplicated.sleepymiles;
+	}
+}
+
+export function isOutdated(mod: Mod): boolean {
+	if (mod.versions.length === 0) {
+		return false;
+	}
+
+	return mod.version !== mod.versions[0].name;
+}
+
+export function isNonReleaseVersion(version: string): boolean {
+	const metadataSeparator = version.indexOf('+');
+	const versionExtraSeparator = version.indexOf('-');
+	return (
+		versionExtraSeparator > 0 &&
+		(metadataSeparator < 0 ? 1 << 30 : metadataSeparator) > versionExtraSeparator
+	);
+}
+
+export function hasNonReleaseUpgrade(mod: Mod): boolean {
+	if (mod.versions.length === 0) {
+		return false;
+	}
+
+	if (isNonReleaseVersion(mod.version ?? '')) {
+		return false;
+	}
+
+	return isNonReleaseVersion(mod.versions[0].name);
+}
+
+/** SleepyMiles' mod site: the second mod source next to Thunderstore. */
+export const SLEEPYMILES_SITE_URL = 'https://sleepymiles.github.io/miles-lc-mods/';
+
+export function sleepymilesModUrl(name?: string) {
+	return name === undefined ? SLEEPYMILES_SITE_URL : `${SLEEPYMILES_SITE_URL}#mod-${name}`;
+}
+
+export function communityUrl(backend: Backend, author: string, mod?: string) {
+	if (backend === Backend.SleepyMiles) {
+		return sleepymilesModUrl(mod);
+	} else {
+		return `https://thunderstore.io/c/${games.active?.slug}/p/${author}${mod ? `/${mod}` : ''}/`;
+	}
+}
+
+export function modIconSrc(mod: Mod, enabled?: boolean) {
+	if (mod.type === 'remote') {
+		if (mod.backend === Backend.Thunderstore) {
+			let fullName = `${mod.author}-${mod.name}-${mod.version}`;
+			return thunderstoreIconUrl(fullName);
+		} else {
+			return sleepymilesIconUrl(mod.author ?? '', mod.name, mod.version ?? '');
+		}
+	} else if (mod.icon !== null) {
+		let path = enabled === false ? mod.icon + '.old' : mod.icon;
+		return convertFileSrc(path);
+	} else {
+		return `games/${games.active?.slug}.webp`;
+	}
+}
+
+export function gameIconSrc(game: Game) {
+	if (game.backends.includes(Backend.Thunderstore)) {
+		return `https://ccdn.thunderstore.io/assets/${game.slug}/${game.slug}-icon-192x192.webp`;
+	} else if (game.backends.includes(Backend.SleepyMiles)) {
+		return `${SLEEPYMILES_SITE_URL}favicon.png`;
+	} else {
+		return `https://raw.githubusercontent.com/Kesomannen/gale/refs/heads/master/images/games/${game.slug}.webp`;
+	}
+}
+
+export function thunderstoreIconUrl(fullName: string) {
+	return `https://ccdn.thunderstore.io/live/repository/icons/${fullName}.png`;
+}
+
+export function sleepymilesIconUrl(_pkg: string, name: string, version: string) {
+	return `${SLEEPYMILES_SITE_URL}mods/${name}/icon.png?${version}`;
+}
+
+export function capitalize(str: string): string {
+	return str.charAt(0).toLocaleUpperCase() + str.slice(1);
+}
+
+export interface ListSeparator {
+	type: 'default' | 'custom';
+	char: string;
+}
+
+const listSeparatorKeyword = 'ListSeparator=';
+
+export function getListSeparator({ description }: ConfigEntry): ListSeparator {
+	if (description !== null) {
+		let separatorIndex = description.indexOf(listSeparatorKeyword);
+
+		if (separatorIndex !== -1) {
+			return { type: 'custom', char: description[separatorIndex + listSeparatorKeyword.length] };
+		}
+	}
+
+	return { type: 'default', char: ',' };
+}
+
+export function fileToBase64(file: File): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.readAsDataURL(file);
+		reader.onload = () => {
+			const result = reader.result as string;
+			resolve(result.split(',')[1]); // Extract only the Base64 part
+		};
+		reader.onerror = (error) => reject(error);
+	});
+}
+
+export function isValidHex(str: string) {
+	return /^#?([0-9A-Fa-f]{6})$/.test(str);
+}
+
+export function discordAvatarUrl(discordId: string, avatar: string) {
+	return `https://cdn.discordapp.com/avatars/${discordId}/${avatar}.png`;
+}
+
+export function selectItems(
+	items: string[],
+	getLabel: (item: string) => string = (value) => value as string
+) {
+	return items.map((item) => ({ value: item, label: getLabel(item) }));
+}
+
+export function emptyOrUndefined(str: string) {
+	if (str.length === 0) return undefined;
+	return str;
+}
+
+export async function getMarkdown(mod: Mod, type: MarkdownType, useLatest = false) {
+	switch (mod.type) {
+		case ModType.Remote:
+			return await api.thunderstore.getMarkdown(
+				{
+					packageUuid: mod.uuid,
+					versionUuid: useLatest ? mod.versions[0].uuid : mod.versionUuid,
+					backend: mod.backend
+				},
+				type
+			);
+
+		case ModType.Local:
+			return await api.profile.getLocalMarkdown(mod.uuid, type);
+	}
+}
+
+export function loaderSupportsModpacks(loader: ModLoader) {
+	switch (loader) {
+		case ModLoader.BepInEx:
+		case ModLoader.BepisLoader:
+		case ModLoader.MelonLoader:
+		case ModLoader.Shimloader:
+		case ModLoader.Lovely:
+		case ModLoader.ReturnOfModding:
+			return true;
+
+		case ModLoader.Northstar:
+		case ModLoader.GDWeave:
+			return false;
+	}
+}
+
+export function shouldWarnForeignDownload(id: ModId, prefs: Prefs): boolean {
+	if (id.backend === Backend.Thunderstore) return false;
+	if (games.activeBackends.length === 1) return false;
+	return !prefs.backendSkipConfirm;
+}
+
+export function rgbToHex(color: RgbaColor): string {
+	const [r, g, b] = color;
+	return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+}
+
+export function mapModContextItem<T, U>(
+	item: ModContextItem<T>,
+	mapItem: (item: U) => T
+): ModContextItem<U> {
+	return {
+		label: item.label,
+		icon: item.icon,
+		showFor: item.showFor ? (mod, locked) => item.showFor!(mapItem(mod), locked) : undefined,
+		onclick: (mod) => item.onclick(mapItem(mod)),
+		children: item.children
+			? (mod) => item.children!(mapItem(mod)).map((child) => mapModContextItem(child, mapItem))
+			: undefined
+	};
+}
+
+export function resolveModContextItems<T>(
+	items: ModContextItem<T>[],
+	mod: T,
+	locked: boolean
+): ContextItem[] {
+	return items
+		.map((item) => resolveModContextItem(item, mod, locked))
+		.filter((item) => item !== null);
+}
+
+export function resolveModContextItem<T>(
+	item: ModContextItem<T>,
+	mod: T,
+	locked: boolean
+): ContextItem | null {
+	if (item.showFor && !item.showFor(mod, locked)) {
+		return null;
+	}
+
+	const children = item.children?.(mod);
+
+	return {
+		label: item.label,
+		icon: item.icon,
+		onclick: () => item.onclick(mod),
+		children: children ? resolveModContextItems(children, mod, locked) : undefined
+	};
+}

@@ -1,0 +1,445 @@
+use std::{
+    collections::HashSet,
+    env, iter,
+    path::PathBuf,
+    sync::{Mutex, MutexGuard},
+};
+
+use eyre::{Context, Result, bail};
+use include_dir::include_dir;
+use rusqlite::{OptionalExtension, params, types::Type as SqliteType};
+use rusqlite_migration::{Migrations, SchemaVersion};
+use serde::de::DeserializeOwned;
+use tracing::{debug, info, trace};
+use uuid::Uuid;
+
+use crate::{
+    prefs::Prefs,
+    profile::{self, ManagedGame, ModManager, Profile, sync::auth::AuthCredentials},
+    util,
+};
+
+mod migrate;
+
+pub const FILE_NAME: &str = "data.sqlite3";
+pub const SHM_FILE_NAME: &str = "data.sqlite3-shm";
+pub const WAL_FILE_NAME: &str = "data.sqlite3-wal";
+
+pub struct Db(Mutex<rusqlite::Connection>);
+
+pub fn init() -> Result<(Db, bool)> {
+    let path = util::path::default_app_data_dir().join(FILE_NAME);
+
+    let existed = path.exists();
+
+    info!(
+        exists = existed,
+        path = %path.display(),
+        "opening database",
+    );
+
+    let mut conn = rusqlite::Connection::open(path).context("failed to connect")?;
+
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("failed to set journal mode")?;
+
+    conn.pragma_update(None, "synchronous", "normal")
+        .context("failed to set synchronous mode")?;
+
+    if env::var("GALE_DEBUG_SQL").is_ok() {
+        conn.trace(Some(trace_stmt));
+    }
+
+    run_migrations(&mut conn).context("failed to run migrations")?;
+
+    Ok((Db(Mutex::new(conn)), existed))
+}
+
+fn trace_stmt(stmt: &str) {
+    trace!("{stmt}");
+}
+
+static MIGRATIONS_DIR: include_dir::Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
+
+fn run_migrations(conn: &mut rusqlite::Connection) -> Result<()> {
+    let migrations = Migrations::from_directory(&MIGRATIONS_DIR)?;
+
+    let latest_version = MIGRATIONS_DIR.dirs().count();
+
+    let current_version = match migrations
+        .current_version(conn)
+        .context("failed to get current database version")?
+    {
+        SchemaVersion::NoneSet => {
+            debug!("database has no version set");
+            0usize
+        }
+        SchemaVersion::Inside(version) => version.into(),
+        SchemaVersion::Outside(_) => bail!(
+            "database has been modified by a newer version of Gale, please update to the latest version"
+        ),
+    };
+
+    if latest_version == current_version {
+        debug!(version = latest_version, "database is up to date");
+        return Ok(());
+    }
+
+    if let Some(db_path) = conn.path() {
+        let backup_path = PathBuf::from(db_path).with_added_extension("bak");
+        debug!(path = %backup_path.display(), "creating backup of database before migration");
+
+        std::fs::copy(db_path, &backup_path)
+            .context("failed to create backup of database before migration")?;
+    }
+
+    migrations.to_version(conn, latest_version)?;
+
+    Ok(())
+}
+
+fn map_json_row<I, T>(row: &rusqlite::Row, idx: I) -> rusqlite::Result<T>
+where
+    I: rusqlite::RowIndex,
+    T: DeserializeOwned,
+{
+    let string = row.get::<_, String>(idx)?;
+    serde_json::from_str(&string).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, SqliteType::Text, Box::new(err))
+    })
+}
+
+fn map_json_option_row<I, T>(row: &rusqlite::Row, idx: I) -> rusqlite::Result<Option<T>>
+where
+    I: rusqlite::RowIndex,
+    T: DeserializeOwned,
+{
+    match map_json_row(row, idx) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::InvalidColumnType(_, _, SqliteType::Null)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub struct ManagerData {
+    pub id: i64,
+    pub active_game_slug: Option<String>,
+    pub hidden_mods: HashSet<Uuid>,
+}
+
+pub struct ManagedGameData {
+    pub id: i64,
+    pub slug: String,
+    pub favorite: bool,
+    pub active_profile_id: i64,
+}
+
+pub struct ProfileData {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub game_slug: String,
+    pub mods: Vec<profile::ProfileMod>,
+    pub modpack: Option<profile::export::modpack::ModpackArgs>,
+    pub ignored_updates: Option<HashSet<Uuid>>,
+    pub sync_data: Option<profile::sync::SyncProfileData>,
+    pub custom_args: String,
+    pub ignored_package_updates: Option<HashSet<Uuid>>,
+    pub excluded_export_files: Option<HashSet<PathBuf>>,
+}
+
+pub struct SaveData {
+    pub manager: ManagerData,
+    pub games: Vec<ManagedGameData>,
+    pub profiles: Vec<ProfileData>,
+}
+
+impl Db {
+    fn conn(&self) -> MutexGuard<'_, rusqlite::Connection> {
+        self.0.lock().unwrap()
+    }
+
+    fn with_transaction<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&rusqlite::Transaction) -> Result<()>,
+    {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        f(&tx)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn next_profile_id(&self) -> Result<i64> {
+        let conn = self.conn();
+
+        let res = conn
+            .prepare("SELECT MAX(id) + 1 FROM profiles")?
+            .query_row((), |row| match row.get::<_, i64>(0) {
+                Ok(value) => Ok(value),
+                // if there are no profiles, return 1
+                Err(rusqlite::Error::InvalidColumnType(_, _, SqliteType::Null)) => Ok(1),
+                err => err,
+            })?;
+
+        Ok(res)
+    }
+
+    pub fn save_auth(&self, creds: Option<&AuthCredentials>) -> Result<()> {
+        self.with_transaction(|tx| {
+            let json = creds.map(serde_json::to_string).transpose()?;
+
+            tx.prepare("INSERT OR REPLACE INTO auth (id, data) VALUES (?, ?)")?
+                .execute(params![1, json])?;
+
+            Ok(())
+        })
+    }
+
+    pub fn read(&self) -> Result<(SaveData, Prefs, Option<AuthCredentials>, bool)> {
+        if migrate::should_migrate() {
+            let (data, prefs) = migrate::migrate().context("failed to migrate legacy save data")?;
+
+            return Ok((data, prefs, None, true));
+        }
+
+        let conn = self.conn();
+
+        let manager = conn
+            .prepare("SELECT id, active_game_slug, hidden_mods FROM manager")?
+            .query_row((), |row| {
+                Ok(ManagerData {
+                    id: row.get(0)?,
+                    active_game_slug: row.get(1)?,
+                    hidden_mods: map_json_row(row, 2)?,
+                })
+            })
+            .optional()?
+            .unwrap_or(ManagerData {
+                id: 1,
+                active_game_slug: None,
+                hidden_mods: HashSet::new(),
+            });
+
+        let games = conn
+            .prepare("SELECT id, slug, favorite, active_profile_id FROM managed_games")?
+            .query_map((), |row| {
+                Ok(ManagedGameData {
+                    id: row.get(0)?,
+                    slug: row.get(1)?,
+                    favorite: row.get(2)?,
+                    active_profile_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read games")?;
+
+        let mut profiles = conn
+            .prepare(
+                "SELECT
+                    id,
+                    name,
+                    path,
+                    game_slug,
+                    mods,
+                    modpack,
+                    ignored_updates,
+                    sync_data,
+                    custom_args,
+                    ignored_package_updates,
+                    excluded_export_files
+                FROM profiles",
+            )?
+            .query_map((), |row| {
+                let mut mods: Vec<profile::ProfileMod> = map_json_row(row, 4)?;
+                mods.dedup_by(|a, b| a.kind.uuid() == b.kind.uuid());
+
+                // custom args may be a json array of strings instead of one string
+                let custom_args = match map_json_option_row::<_, Vec<String>>(row, 8) {
+                    Ok(Some(args)) => args.join(" "),
+                    Ok(None) => String::new(),
+                    Err(_) => row.get(8)?,
+                };
+
+                Ok(ProfileData {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    game_slug: row.get(3)?,
+                    mods,
+                    modpack: map_json_option_row(row, 5)?,
+                    ignored_updates: map_json_option_row(row, 6)?,
+                    sync_data: map_json_option_row(row, 7)?,
+                    custom_args,
+                    ignored_package_updates: map_json_option_row(row, 9)?,
+                    excluded_export_files: map_json_option_row(row, 10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read profiles")?;
+
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let prefs = conn
+            .prepare("SELECT data FROM prefs")?
+            .query_row((), |row| map_json_row(row, 0))
+            .optional()
+            .context("failed to read prefs")?
+            .unwrap_or_default();
+
+        let auth_state = conn
+            .prepare("SELECT data FROM auth")?
+            .query_row((), |row| map_json_option_row(row, 0))
+            .optional()
+            .context("failed to read auth")?
+            .flatten();
+
+        Ok((
+            SaveData {
+                manager,
+                games,
+                profiles,
+            },
+            prefs,
+            auth_state,
+            false,
+        ))
+    }
+
+    pub fn delete_profile(&self, id: i64) -> Result<()> {
+        self.with_transaction(|tx| {
+            tx.prepare("DELETE FROM profiles WHERE id = ?")?
+                .execute([id])?;
+
+            Ok(())
+        })
+    }
+
+    pub fn save_all(&self, manager: &ModManager) -> Result<()> {
+        self.with_transaction(|tx| {
+            self._save_manager(tx, manager)?;
+            self.save_games(tx, manager.games.values())?;
+            self.save_profiles(tx, manager.games.values().flat_map(|game| &game.profiles))?;
+
+            Ok(())
+        })
+    }
+
+    pub fn save_manager(&self, manager: &ModManager) -> Result<()> {
+        self.with_transaction(|tx| self._save_manager(tx, manager))
+    }
+
+    fn _save_manager(&self, tx: &rusqlite::Transaction, manager: &ModManager) -> Result<()> {
+        tx.execute(
+            "INSERT OR REPLACE INTO manager (id, active_game_slug, hidden_mods)
+            VALUES (?, ?, ?)",
+            params![
+                1,
+                manager.active_game.slug,
+                serde_json::to_string(&manager.hidden_mods)?
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn save_game(&self, game: &ManagedGame) -> Result<()> {
+        self.with_transaction(|tx| self.save_games(tx, iter::once(game)))
+    }
+
+    fn save_games<'a>(
+        &self,
+        tx: &rusqlite::Transaction,
+        games: impl Iterator<Item = &'a ManagedGame>,
+    ) -> Result<()> {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO managed_games (id, slug, favorite, active_profile_id)
+                VALUES (?, ?, ?, ?)",
+        )?;
+
+        for game in games {
+            stmt.execute(params![
+                game.id,
+                game.game.slug,
+                game.favorite,
+                game.active_profile_id
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn save_profile(&self, profile: &Profile) -> Result<()> {
+        self.with_transaction(|tx| self.save_profiles(tx, iter::once(profile)))
+    }
+
+    fn save_profiles<'a>(
+        &self,
+        tx: &rusqlite::Transaction,
+        profiles: impl Iterator<Item = &'a Profile>,
+    ) -> Result<()> {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO profiles 
+                (
+                    id,
+                    name,
+                    path,
+                    game_slug,
+                    mods,
+                    modpack,
+                    ignored_updates,
+                    sync_data,
+                    custom_args,
+                    ignored_package_updates,
+                    excluded_export_files
+                ) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+
+        for profile in profiles {
+            let mods = serde_json::to_string(&profile.mods)?;
+            let modpack = profile
+                .modpack
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let ignored_updates = serde_json::to_string(&profile.ignored_version_updates)?;
+            let sync_data = profile
+                .sync
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let ignored_package_updates = serde_json::to_string(&profile.ignored_package_updates)?;
+            let excluded_export_files = serde_json::to_string(&profile.excluded_export_files)?;
+
+            stmt.execute(params![
+                profile.id,
+                profile.name,
+                profile.path.to_string_lossy(),
+                profile.game.slug,
+                mods,
+                modpack,
+                ignored_updates,
+                sync_data,
+                profile.custom_args,
+                ignored_package_updates,
+                excluded_export_files,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn save_prefs(&self, prefs: &Prefs) -> Result<()> {
+        self.with_transaction(|tx| {
+            let json = serde_json::to_string(prefs).context("failed to serialize to json")?;
+
+            tx.prepare("INSERT OR REPLACE INTO prefs (id, data) VALUES (1, ?)")?
+                .execute([json])?;
+
+            Ok(())
+        })
+    }
+}

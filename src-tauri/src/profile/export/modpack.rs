@@ -1,0 +1,449 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    io::{Cursor, Seek, Write},
+    path::{Path, PathBuf},
+};
+
+use bytes::Bytes;
+use eyre::{Context, OptionExt, Result, anyhow, bail, ensure, eyre};
+use futures_util::future::try_join_all;
+use image::{ImageFormat, imageops::FilterType};
+use itertools::Itertools;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Url};
+use tracing::{debug, info, trace};
+use uuid::Uuid;
+use zip::{ZipWriter, write::SimpleFileOptions};
+
+use crate::{
+    game::Game,
+    profile::Profile,
+    state::ManagerExt,
+    thunderstore::{
+        Backend, CompletedPart, ModId, PackageManifest, PackageSubmissionMetadata, Thunderstore,
+        UploadPartUrl, UploadSubmissionResult, UserMediaFinishUploadParams,
+        UserMediaInitiateUploadParams, UserMediaInitiateUploadResponse,
+    },
+};
+
+/// Returns whether it's sleepymiles-exclusive now
+pub fn refresh_args(profile: &mut Profile, thunderstore: &Thunderstore, game: Game) -> bool {
+    if profile.modpack.is_none() {
+        profile.modpack = Some(ModpackArgs {
+            name: profile.name.replace([' ', '-'], ""),
+            readme: format!("# {}\n\n", profile.name),
+            changelog: "# Changelog\n\n## 1.0.0\n\n- Initial release".to_owned(),
+            version_number: "1.0.0".to_owned(),
+            ..Default::default()
+        });
+    }
+
+    let sleepymiles_exclusive = profile.has_sleepymiles_exclusive_mods(thunderstore);
+    if sleepymiles_exclusive {
+        profile.modpack.as_mut().unwrap().backend = Backend::SleepyMiles;
+    }
+
+    let config_files: HashSet<PathBuf> = super::list_files(&profile.path)
+        .filter(|path| {
+            game.mod_loader
+                .mod_config_dirs()
+                .iter()
+                .any(|dir| path.starts_with(dir))
+        })
+        .collect();
+
+    let included_files = &mut profile.modpack.as_mut().unwrap().include_files;
+
+    included_files
+        .retain(|file, _| config_files.contains(file) && profile.path.join(file).exists());
+
+    for path in config_files {
+        included_files.entry(path).or_insert(true);
+    }
+
+    sleepymiles_exclusive
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModpackArgs {
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub categories: Vec<String>,
+    pub nsfw: bool,
+    pub readme: String,
+    #[serde(default)]
+    pub changelog: String,
+    pub version_number: String,
+    pub icon_path: PathBuf,
+    pub website_url: String,
+    pub include_disabled: bool,
+    #[serde(default, rename = "includeFileMap")]
+    pub include_files: HashMap<PathBuf, bool>,
+    #[serde(default)]
+    pub backend: Backend,
+}
+
+impl Profile {
+    pub(super) fn mods_to_pack<'a>(
+        &'a self,
+        args: &'a ModpackArgs,
+    ) -> impl Iterator<Item = &'a ModId> + 'a {
+        self.thunderstore_mods()
+            .filter(move |(_, enabled)| args.include_disabled || *enabled)
+            .map(|(ts_mod, _)| &ts_mod.id)
+    }
+
+    pub fn export_pack(
+        &self,
+        args: &ModpackArgs,
+        writer: impl Write + Seek,
+        thunderstore: &Thunderstore,
+    ) -> Result<()> {
+        ensure!(!args.name.is_empty(), "name cannot be empty");
+        ensure!(!args.description.is_empty(), "description cannot be empty");
+
+        let deps = self
+            .mods_to_pack(args)
+            .map(|mod_ref| {
+                let borrowed = mod_ref.borrow(thunderstore)?;
+                Ok(borrowed.version.ident.clone())
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("failed to resolve modpack dependencies")?;
+
+        let version_number =
+            semver::Version::parse(&args.version_number).context("invalid version number")?;
+
+        let manifest = PackageManifest {
+            name: args.name.clone(),
+            description: args.description.clone(),
+            website_url: args.website_url.clone(),
+            dependencies: deps,
+            installers: None,
+            author: None,
+            version_number,
+        };
+
+        let mut zip = ZipWriter::new(writer);
+
+        if !args.readme.is_empty() {
+            trace!("writing readme");
+            zip.start_file("README.md", SimpleFileOptions::default())?;
+            zip.write_all(args.readme.as_bytes())?;
+        }
+
+        if !args.changelog.is_empty() {
+            trace!("writing changelog");
+            zip.start_file("CHANGELOG.md", SimpleFileOptions::default())?;
+            zip.write_all(args.changelog.as_bytes())?;
+        }
+
+        trace!("writing manifest");
+        zip.start_file("manifest.json", SimpleFileOptions::default())?;
+        serde_json::to_writer_pretty(&mut zip, &manifest)?;
+
+        write_icon(&args.icon_path, &mut zip).context("failed to write icon")?;
+
+        super::write_config(
+            args.include_files
+                .iter()
+                .filter(|(_, enabled)| **enabled)
+                .map(|(file, _)| file),
+            &self.path,
+            &mut zip,
+            SimpleFileOptions::default(),
+        )?;
+
+        Ok(())
+    }
+}
+
+fn write_icon<W>(path: &Path, zip: &mut ZipWriter<W>) -> Result<()>
+where
+    W: Write + Seek,
+{
+    let img = image::ImageReader::open(path)?.decode()?;
+    let img = img.resize_exact(256, 256, FilterType::Lanczos3);
+
+    let mut bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)?;
+    zip.start_file("icon.png", SimpleFileOptions::default())?;
+    zip.write_all(&bytes)?;
+
+    Ok(())
+}
+
+fn base_request(
+    app: &AppHandle,
+    tail: impl Display,
+    backend: Backend,
+    token: impl Display,
+) -> reqwest_middleware::RequestBuilder {
+    let url = format!("{}/{tail}/", backend.modpack_upload_base_url());
+
+    app.http().post(url).bearer_auth(token)
+}
+
+pub async fn publish(
+    app: &AppHandle,
+    data: Bytes,
+    game: Game,
+    args: ModpackArgs,
+    token: String,
+) -> Result<UploadSubmissionResult> {
+    ensure!(args.description.len() <= 250, "description is too long");
+    ensure!(!args.readme.is_empty(), "readme cannot be empty");
+    ensure!(!args.author.is_empty(), "author cannot be empty");
+
+    if !args.website_url.is_empty() {
+        Url::parse(&args.website_url).context("invalid website URL")?;
+    }
+
+    // The SleepyMiles site is a static index with no upload API, and Thunderstore rejects
+    // modpacks that depend on mods it doesn't host. Share these profiles with a code instead.
+    ensure!(
+        args.backend != Backend::SleepyMiles,
+        "this profile has mods from SleepyMiles' site, which Thunderstore doesn't host, so it can't be published there. Share it with an export code instead"
+    );
+
+    info!("publishing modpack");
+
+    let response = initiate_upload(
+        app,
+        args.name.clone(),
+        data.len() as u64,
+        args.backend,
+        &token,
+    )
+    .await
+    .context("failed to initiate upload")?;
+
+    let uuid = response.user_media.uuid.ok_or_eyre("no uuid in response")?;
+
+    let tasks = response.upload_urls.into_iter().map(|part| {
+        let data = data.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { upload_chunk(&app, part, data).await })
+    });
+
+    let parts = match try_join_all(tasks)
+        .await
+        .map_err(|err| anyhow!(err))
+        .and_then(|parts| parts.into_iter().collect::<Result<Vec<_>>>())
+    {
+        Ok(parts) => parts,
+        Err(err) => {
+            abort_upload(app, &uuid, args.backend, &token)
+                .await
+                .context("failed to abort upload")?;
+            return Err(err.wrap_err("failed to upload file"));
+        }
+    };
+
+    finish_upload(app, parts, &uuid, args.backend, &token)
+        .await
+        .context("failed to finalize upload")?;
+
+    submit_package(app, uuid, game, args, &token)
+        .await
+        .context("failed to submit package")
+}
+
+async fn initiate_upload(
+    app: &AppHandle,
+    name: String,
+    size: u64,
+    backend: Backend,
+    token: &str,
+) -> Result<UserMediaInitiateUploadResponse> {
+    debug!(
+        "initiating modpack upload for {}, size: {} bytes",
+        name, size
+    );
+
+    let response = base_request(app, "usermedia/initiate-upload", backend, token)
+        .json(&UserMediaInitiateUploadParams {
+            filename: name,
+            file_size_bytes: size,
+        })
+        .send()
+        .await?
+        .map_auth_err()?
+        .json::<UserMediaInitiateUploadResponse>()
+        .await?;
+
+    debug!("recieved {} upload urls", response.upload_urls.len());
+
+    Ok(response)
+}
+
+async fn upload_chunk(app: &AppHandle, part: UploadPartUrl, data: Bytes) -> Result<CompletedPart> {
+    let start = part.offset as usize;
+    let end = start + part.length as usize;
+    let chunk = data.slice(start..end);
+
+    let response = app
+        .http()
+        .put(&part.url)
+        .body(chunk)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let tag = response
+        .headers()
+        .get("ETag")
+        .ok_or_eyre("no ETag in response")?
+        .to_str()
+        .context("ETag is not valid utf-8")?
+        .to_owned();
+
+    debug!("uploaded part {} with tag {}", part.part_number, tag);
+
+    Ok(CompletedPart {
+        tag,
+        part_number: part.part_number,
+    })
+}
+
+async fn abort_upload(app: &AppHandle, uuid: &Uuid, backend: Backend, token: &str) -> Result<()> {
+    info!("aborting upload");
+
+    base_request(
+        app,
+        format!("usermedia/{uuid}/abort-upload"),
+        backend,
+        token,
+    )
+    .json(&uuid)
+    .send()
+    .await?
+    .map_auth_err()?;
+
+    Ok(())
+}
+
+async fn finish_upload(
+    app: &AppHandle,
+    parts: Vec<CompletedPart>,
+    uuid: &Uuid,
+    backend: Backend,
+    token: &str,
+) -> Result<()> {
+    debug!("finishing upload");
+
+    base_request(
+        app,
+        format!("usermedia/{uuid}/finish-upload"),
+        backend,
+        token,
+    )
+    .json(&UserMediaFinishUploadParams { parts })
+    .send()
+    .await?
+    .map_auth_err()?;
+
+    Ok(())
+}
+
+async fn submit_package(
+    app: &AppHandle,
+    uuid: Uuid,
+    game: Game,
+    args: ModpackArgs,
+    token: &str,
+) -> Result<UploadSubmissionResult> {
+    let metadata = PackageSubmissionMetadata {
+        author_name: args.author,
+        has_nsfw_content: args.nsfw,
+        upload_uuid: uuid,
+        categories: Vec::new(),
+        communities: vec![game.slug.to_string()],
+        community_categories: HashMap::from([(game.slug.to_string(), args.categories)]),
+    };
+
+    debug!("submitting package");
+
+    let response = base_request(app, "submission/submit", args.backend, token)
+        .json(&metadata)
+        .send()
+        .await?;
+
+    let status = response.status();
+
+    if response.status().is_success() {
+        return Ok(response.json::<UploadSubmissionResult>().await?);
+    }
+
+    if status == StatusCode::BAD_REQUEST
+        && let Ok(Some(err)) = handle_bad_request(response).await
+    {
+        bail!("{}", err)
+    }
+
+    bail!("unexpected error: {}", status);
+
+    async fn handle_bad_request(response: reqwest::Response) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Error {
+            file: Vec<String>,
+        }
+
+        let err = response.json::<Error>().await?;
+
+        if err.file.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            err.file
+                .into_iter()
+                .map(|err| match err.split_once(':') {
+                    Some((_field, msg)) => msg.trim().to_owned(),
+                    None => err,
+                })
+                .collect_vec()
+                .join(", "),
+        ))
+    }
+}
+
+trait ReqwestResponseExt {
+    fn map_auth_err_with<F>(self, f: F) -> eyre::Result<reqwest::Response>
+    where
+        F: FnOnce(StatusCode) -> Option<eyre::Error>;
+
+    fn map_auth_err(self) -> eyre::Result<reqwest::Response>;
+}
+
+impl ReqwestResponseExt for reqwest::Response {
+    fn map_auth_err_with<F>(self, f: F) -> eyre::Result<reqwest::Response>
+    where
+        F: FnOnce(StatusCode) -> Option<eyre::Error>,
+    {
+        self.error_for_status().map_err(|err| {
+            if let Some(status) = err.status() {
+                match status {
+                    StatusCode::UNAUTHORIZED => eyre!("thunderstore API token is invalid"),
+                    _ => {
+                        if let Some(err) = f(status) {
+                            err
+                        } else {
+                            eyre!(err)
+                        }
+                    }
+                }
+            } else {
+                eyre!(err)
+            }
+        })
+    }
+
+    fn map_auth_err(self) -> eyre::Result<reqwest::Response> {
+        self.map_auth_err_with(|_| None)
+    }
+}

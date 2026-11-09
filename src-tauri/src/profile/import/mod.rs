@@ -1,0 +1,520 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self, File},
+    io::{BufReader, Cursor, Read, Seek},
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
+
+use base64::{Engine, prelude::BASE64_STANDARD};
+use eyre::{Context, Result, eyre};
+use futures_util::future;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use itertools::Itertools;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tempfile::tempdir;
+use tracing::{debug, info, trace, warn};
+use uuid::Uuid;
+
+use crate::{
+    game::Game,
+    prefs::Backends,
+    profile::{
+        export::{PROFILE_DATA_PREFIX, ProfileManifest},
+        install::{InstallOptions, ModInstall},
+    },
+    state::ManagerExt,
+    thunderstore::{Backend, FromBackend, ModId, Thunderstore},
+    util::{self, error::IoResultExt},
+};
+
+pub mod commands;
+mod local;
+mod r2modman;
+
+use super::Profile;
+pub use local::{import_local_mod, import_local_mod_base64};
+
+pub fn read_file_at_path(path: PathBuf, thunderstore: &Thunderstore) -> Result<ImportData> {
+    let file = File::open(&path).fs_context("opening file", &path)?;
+
+    read_file(file, thunderstore)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportData {
+    pub manifest: ProfileManifest,
+    pub path: PathBuf,
+    pub delete_after_import: bool,
+}
+
+pub fn read_file_from(path: PathBuf, thunderstore: &Thunderstore) -> Result<ImportData> {
+    let file = File::open(&path).fs_context("opening file", &path)?;
+
+    read_file(file, thunderstore)
+}
+
+pub(super) fn read_file(
+    source: impl Read + Seek,
+    thunderstore: &Thunderstore,
+) -> Result<ImportData> {
+    let temp_dir = tempdir().context("failed to create temporary directory")?;
+    util::zip::extract(source, temp_dir.path())?;
+
+    let reader = File::open(temp_dir.path().join("export.r2x"))
+        .map(BufReader::new)
+        .context("failed to open profile manifest")?;
+
+    let mut manifest: ProfileManifest =
+        serde_yaml::from_reader(reader).context("failed to read profile manifest")?;
+
+    for r2mod in &mut manifest.mods {
+        // first try the backend stored in the manifest, if it's not there,
+        // then try falling back to checking any other backend and update the source as needed
+        match thunderstore.find_ident(&r2mod.version_ident(), FromBackend::Prefer(r2mod.source)) {
+            Ok(found) if found.package.backend == r2mod.source => (),
+            Ok(found) => {
+                warn!(
+                    ident = %r2mod.version_ident(),
+                    source = ?r2mod.source,
+                    found_backend = ?found.package.backend,
+                    "import mod was not found in the expected backend, falling back",
+                );
+                r2mod.source = found.package.backend;
+            }
+            Err(err) => {
+                debug!(?err, "import mod was not found");
+            }
+        }
+    }
+
+    Ok(ImportData {
+        manifest,
+        path: temp_dir.keep(),
+        delete_after_import: true,
+    })
+}
+
+fn read_base64(base64: &str, thunderstore: &Thunderstore) -> Result<ImportData> {
+    let bytes = BASE64_STANDARD
+        .decode(base64)
+        .context("failed to decode base64 data")?;
+
+    read_file(Cursor::new(bytes), thunderstore)
+}
+
+pub async fn read_code(key: Uuid, app: &AppHandle) -> Result<ImportData> {
+    let response = future::join_all(
+        Backends::All
+            .iter()
+            .map(async |backend| read_code_from_backend(backend, key, app).await),
+    )
+    .await
+    .into_iter()
+    .find_or_first(std::result::Result::is_ok)
+    .unwrap()?;
+
+    match response.strip_prefix(PROFILE_DATA_PREFIX) {
+        Some(str) => read_base64(str, &app.lock_thunderstore()),
+        None => Err(eyre!("invalid profile data")),
+    }
+}
+
+async fn read_code_from_backend(backend: Backend, key: Uuid, app: &AppHandle) -> Result<String> {
+    let response = app
+        .http()
+        .get(backend.profile_import(&key.to_string()))
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|err| match err.status() {
+            Some(status) if status == StatusCode::NOT_FOUND => {
+                eyre!("profile code is expired or invalid")
+            }
+            _ => err.into(),
+        })?
+        .text()
+        .await?;
+
+    Ok(response)
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ImportOptions {
+    config: ImportConfigOption,
+    merge: bool,
+    ignore_missing_mods: bool,
+}
+
+impl ImportOptions {
+    // pub fn import_all(mut self, import_all: bool) -> Self {
+    //     self.import_all = import_all;
+    //     self
+    // }
+
+    pub fn merge(mut self, merge: bool) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    pub fn ignore_missing_mods(mut self, ignore_missing_mods: bool) -> Self {
+        self.ignore_missing_mods = ignore_missing_mods;
+        self
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+pub enum ImportConfigOption {
+    All,
+    #[default]
+    Safe,
+    None,
+}
+
+pub(super) async fn import_profile(
+    data: ImportData,
+    options: ImportOptions,
+    install_options: InstallOptions,
+    app: &AppHandle,
+) -> Result<i64> {
+    info!(
+        name = %data.manifest.name,
+        options = ?options,
+        install_options = ?install_options,
+        "importing profile"
+    );
+
+    let (profile_id, profile_path, game, to_install) =
+        prepare_import(&options, data.manifest, app)?;
+
+    let result = app
+        .install_queue()
+        .install(to_install, profile_id, install_options, app)
+        .await;
+
+    let result = match result {
+        Ok(()) => {
+            if options.config != ImportConfigOption::None {
+                let manager = app.lock_manager();
+                let (_, profile) = manager.profile_by_id(profile_id)?;
+
+                import_config(
+                    &profile_path,
+                    &data.path,
+                    game.mod_loader.mod_config_dirs(),
+                    |path| !profile.excluded_export_files.contains(path),
+                    &options,
+                )
+                .context("error importing config")?;
+            }
+
+            Ok(profile_id)
+        }
+        Err(err) => {
+            cleanup_failed_profile(profile_id, app).unwrap_or_else(|err| {
+                warn!(
+                    "failed to remove profile after failed or cancelled import: {}",
+                    err
+                );
+            });
+
+            Err(err.into())
+        }
+    };
+
+    if data.delete_after_import {
+        fs::remove_dir_all(&data.path).unwrap_or_else(|err| {
+            warn!("failed to remove source folder after import: {}", err);
+        });
+    }
+
+    result
+}
+
+fn prepare_import(
+    options: &ImportOptions,
+    manifest: ProfileManifest,
+    app: &AppHandle,
+) -> Result<(i64, PathBuf, Game, Vec<ModInstall>)> {
+    let ProfileManifest {
+        name,
+        mods,
+        ignored_version_updates,
+        ignored_package_updates,
+        ..
+    } = manifest;
+
+    let mut manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+
+    let installs = mods
+        .into_iter()
+        .filter_map(|r2_mod| match r2_mod.to_install(&thunderstore) {
+            Ok(install) => Some(Ok(install)),
+            Err(err) if options.ignore_missing_mods => {
+                warn!(
+                    ?err,
+                    ident = %r2_mod.version_ident(),
+                    "ignoring missing mod during import",
+                );
+                None
+            }
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let game = manager.active_game_mut();
+
+    let (profile, to_install) = if let Some(profile_index) = game.find_profile_index(&name) {
+        // overwrite an existing profile
+        let profile = game.set_active_profile(profile_index)?;
+        let to_install = incremental_update(options.merge, installs, profile)?.collect_vec();
+
+        (profile, to_install)
+    } else {
+        let profile = game.create_profile(name, None, app.db())?;
+
+        (profile, installs)
+    };
+
+    profile.ignored_version_updates = ignored_version_updates;
+    profile.ignored_package_updates = ignored_package_updates;
+    profile.excluded_export_files = manifest
+        .excluded_files
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+
+    let id = profile.id;
+    let path = profile.path.clone();
+
+    game.save(app)?;
+
+    Ok((id, path, game.game, to_install))
+}
+
+fn cleanup_failed_profile(profile_id: i64, app: &AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+
+    let (game, _) = manager.profile_by_id(profile_id)?;
+    let managed_game = manager.games.get_mut(game).unwrap();
+
+    if managed_game.profiles.len() > 1 {
+        managed_game.delete_profile(profile_id, false, app.db())?;
+        managed_game.save(app)?;
+    } else {
+        warn!("import failed for last profile");
+    }
+
+    Ok(())
+}
+
+fn incremental_update(
+    merge: bool,
+    installs: impl IntoIterator<Item = ModInstall>,
+    profile: &mut Profile,
+) -> Result<impl Iterator<Item = ModInstall>> {
+    let current_mods: HashMap<ModId, bool> = profile
+        .thunderstore_mods()
+        .map(|(ts_mod, enabled)| (ts_mod.id.clone(), enabled))
+        .collect();
+
+    let current_ids: HashSet<&ModId> = current_mods.keys().collect();
+
+    let mut new_mods: HashMap<ModId, ModInstall> = installs
+        .into_iter()
+        .map(|install| (install.mod_id().clone(), install))
+        .collect();
+
+    let new_ids: HashSet<&ModId> = new_mods.keys().collect();
+
+    if merge {
+        // remove only version mismatches
+        let to_remove = current_mods.keys().filter(|id| {
+            new_mods.values().any(|install| {
+                install.mod_id().package_uuid == id.package_uuid
+                    && install.mod_id().version_uuid != id.version_uuid
+            })
+        });
+        for mod_id in to_remove {
+            profile.force_remove_mod(mod_id.package_uuid)?;
+        }
+    } else {
+        // remove all extra mods
+        let to_remove = current_ids.difference(&new_ids);
+        for mod_id in to_remove {
+            profile.force_remove_mod(mod_id.package_uuid)?;
+        }
+    }
+
+    let to_toggle = current_ids
+        .intersection(&new_ids)
+        .filter(|id| *current_mods.get(*id).unwrap() != new_mods.get(id).unwrap().enabled());
+    for mod_id in to_toggle {
+        profile.force_toggle_mod(mod_id.package_uuid)?;
+    }
+
+    // we have to clone and collect the ids because new_ids.difference() borrows new_mods,
+    // which prevents us from getting the ModInstalls back (since that requires mutably borrowing the map)
+
+    let ids_to_install: Vec<ModId> = new_ids
+        .difference(&current_ids)
+        .map(|id| (*id).clone())
+        .collect();
+
+    let to_install = ids_to_install
+        .into_iter()
+        .map(move |id| new_mods.remove(&id).unwrap());
+
+    Ok(to_install)
+}
+
+#[tracing::instrument(skip_all, fields(dest = %dest.display(), src = %src.display()))]
+pub fn import_config<P, F>(
+    dest: &Path,
+    src: &Path,
+    config_dirs: &[P],
+    mut dest_files_filter: F,
+    options: &ImportOptions,
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: FnMut(&Path) -> bool,
+{
+    let src_files: HashSet<PathBuf> = super::export::list_files(src)
+        .filter(|path| options.config == ImportConfigOption::All || is_path_safe(path))
+        .collect();
+
+    let dest_files: HashSet<PathBuf> = super::export::find_config(dest, config_dirs)
+        .filter(|file| dest_files_filter(file))
+        .collect();
+
+    if !options.merge {
+        // remove existing extra config files that are not in the imported profile
+        // and were not explicitly ignored by the dest_files_filter
+        for extra_file in dest_files.difference(&src_files) {
+            let extra_path = dest.join(extra_file);
+            trace!(
+                relative_path = %extra_file.display(),
+                "removing extra config file"
+            );
+            fs::remove_file(extra_path).fs_context("removing extra config file", extra_file)?;
+        }
+    }
+
+    for file in src_files {
+        let src_path = src.join(&file);
+        let dest_path = if file.starts_with("config") {
+            dest.join("BepInEx").join(&file)
+        } else {
+            dest.join(&file)
+        };
+
+        let need_copy = if dest_path.exists() {
+            util::fs::checksum(&src_path)? != util::fs::checksum(&dest_path)?
+        } else {
+            true
+        };
+
+        if need_copy {
+            trace!(
+                relative_path = %file.display(),
+                "copy file"
+            );
+            fs::create_dir_all(dest_path.parent().unwrap())?;
+            fs::copy(src_path, dest_path)?;
+        } else {
+            trace!(
+                relative_path = %file.display(),
+                "file is identical, skipping copy"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_path_safe(path: impl AsRef<Path>) -> bool {
+    static EXCLUDE_SET: LazyLock<GlobSet> = LazyLock::new(|| {
+        GlobSetBuilder::new()
+            .add(Glob::new("export.r2x").unwrap())
+            .add(Glob::new("mods.yml").unwrap())
+            .add(Glob::new("*.{dll,exe,scr,com,pif,bat,cmd,ps1,vbs,vbe,js,jse,wsf,wsh,hta,msi,msix,sys,drv,cpl,ocx,lnk,reg,inf}").unwrap())
+            .build()
+            .unwrap()
+    });
+
+    !EXCLUDE_SET.is_match(path.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG_DIRS: &[&str] = &["BepInEx/config"];
+
+    fn config_path(root: &Path, name: &str) -> PathBuf {
+        root.join("BepInEx").join("config").join(name)
+    }
+
+    fn write_config(root: &Path, name: &str, contents: &str) {
+        let path = config_path(root, name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn profile_import_removes_extra_config_by_default() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        write_config(source.path(), "baseline.cfg", "new baseline");
+        write_config(destination.path(), "baseline.cfg", "old baseline");
+        write_config(destination.path(), "greylist.cfg", "player settings");
+
+        import_config(
+            destination.path(),
+            source.path(),
+            CONFIG_DIRS,
+            |_| true,
+            &ImportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(config_path(destination.path(), "baseline.cfg")).unwrap(),
+            "new baseline"
+        );
+        assert!(!config_path(destination.path(), "greylist.cfg").exists());
+    }
+
+    #[test]
+    fn merged_profile_import_preserves_extra_config() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        write_config(source.path(), "baseline.cfg", "new baseline");
+        write_config(destination.path(), "baseline.cfg", "old baseline");
+        write_config(destination.path(), "greylist.cfg", "player settings");
+
+        import_config(
+            destination.path(),
+            source.path(),
+            CONFIG_DIRS,
+            |_| true,
+            &ImportOptions::default().merge(true),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(config_path(destination.path(), "baseline.cfg")).unwrap(),
+            "new baseline"
+        );
+        assert_eq!(
+            fs::read_to_string(config_path(destination.path(), "greylist.cfg")).unwrap(),
+            "player settings"
+        );
+    }
+}

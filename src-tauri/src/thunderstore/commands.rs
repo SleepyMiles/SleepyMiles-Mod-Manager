@@ -1,0 +1,118 @@
+use eyre::{ContextCompat, anyhow};
+use futures_util::TryFutureExt;
+use itertools::Itertools;
+use tauri::{AppHandle, command};
+use tracing::warn;
+
+use super::{Backend, query::QueryModsArgs};
+use crate::{
+    game, logger,
+    state::ManagerExt,
+    thunderstore::{ModId, PackageCategory, cache::MarkdownKind, query::ModListQueryItem},
+    util::cmd::Result,
+};
+
+#[command]
+pub fn query_thunderstore(args: QueryModsArgs, app: AppHandle) -> Vec<ModListQueryItem> {
+    let manager = app.lock_manager();
+    let mut thunderstore = app.lock_thunderstore();
+
+    // return some results immediately...
+    let result = thunderstore.query_mods(&args, &manager).collect_vec();
+
+    // ...then if we still have packages to fetch, continue fetching and returning new results in the background
+    if !thunderstore.packages_fetched(&app, manager.active_game) {
+        thunderstore.current_query = Some(args);
+    }
+
+    result
+}
+
+#[command]
+pub fn stop_querying_thunderstore(app: AppHandle) {
+    app.lock_thunderstore().current_query = None;
+}
+
+#[command]
+pub fn trigger_mod_fetch(app: AppHandle) -> Result<()> {
+    let game = app.lock_manager().active_game;
+
+    let write_directly = {
+        let state = app.lock_thunderstore();
+
+        if state.is_fetching {
+            return Err(anyhow!("already fetching mods").into());
+        }
+
+        !state.packages_fetched(&app, game)
+    };
+
+    tauri::async_runtime::spawn(async move {
+        let cancel_token = app.lock_thunderstore().fetch_cancel_token.clone();
+
+        for (backend, err) in
+            super::fetch::fetch_packages(game, write_directly, &app, &cancel_token).await
+        {
+            logger::log_webview_err(
+                format!("error while fetching mods from {backend}"),
+                err,
+                &app,
+            );
+        }
+    });
+
+    Ok(())
+}
+
+#[command]
+pub async fn get_markdown(
+    mod_ref: ModId,
+    kind: MarkdownKind,
+    app: AppHandle,
+) -> Result<Option<String>> {
+    let content = super::cache::get_markdown(kind, mod_ref, &app).await?;
+    Ok(content)
+}
+
+#[command]
+pub fn set_api_token(backend: Backend, token: &str) -> Result<()> {
+    super::token::set(backend, token)?;
+    Ok(())
+}
+
+#[command]
+pub fn has_api_token(backend: Backend) -> bool {
+    super::token::get(backend).is_ok_and(|token| token.is_some())
+}
+
+#[command]
+pub fn clear_api_token(backend: Backend) -> Result<()> {
+    super::token::clear(backend)?;
+    Ok(())
+}
+
+#[command]
+pub async fn get_categories(game: &str, app: AppHandle) -> Result<Vec<PackageCategory>> {
+    let game = game::from_slug(game).context("unknown game")?;
+
+    let tasks = game
+        .backends
+        .iter()
+        .map(|backend| super::get_categories(*backend, game, &app).map_err(|err| (*backend, err)));
+    let categories = futures_util::future::join_all(tasks)
+        .await
+        .into_iter()
+        .filter_map(|result| match result {
+            Ok(categories) => Some(categories),
+            Err((backend, error)) => {
+                warn!(%backend, ?error, "failed to fetch categories");
+                None
+            }
+        })
+        .flatten()
+        .unique_by(|category| category.name.clone())
+        .sorted()
+        .collect();
+
+    Ok(categories)
+}

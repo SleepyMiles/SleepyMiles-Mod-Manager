@@ -1,0 +1,276 @@
+use crate::{
+    game::Game,
+    thunderstore::{BorrowedMod, PackageIdent, PackageListing, VersionIdent, cache::MarkdownKind},
+};
+use eyre::eyre;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+};
+use uuid::Uuid;
+
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq, Hash, Default,
+)]
+pub enum Backend {
+    #[default]
+    Thunderstore,
+    SleepyMiles,
+}
+
+impl Display for Backend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Backend::Thunderstore => "thunderstore",
+            Backend::SleepyMiles => "sleepymiles",
+        })
+    }
+}
+
+impl FromStr for Backend {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "thunderstore" => Ok(Self::Thunderstore),
+            "sleepymiles" => Ok(Self::SleepyMiles),
+            _ => Err(()),
+        }
+    }
+}
+
+/// SleepyMiles' mod site: a static GitHub Pages site serving a Thunderstore-format package index.
+/// Mod zips live on the GitHub releases of the same repository, tagged `<Name>-<version>`.
+pub const SITE_URL: &str = "https://sleepymiles.github.io/miles-lc-mods/";
+pub const SITE_RELEASES_URL: &str = "https://github.com/SleepyMiles/miles-lc-mods/releases/download/";
+
+impl Backend {
+    pub fn other(self) -> Self {
+        match self {
+            Backend::Thunderstore => Backend::SleepyMiles,
+            Backend::SleepyMiles => Backend::Thunderstore,
+        }
+    }
+
+    pub fn index_url(self, game: Game) -> Option<String> {
+        if game.backends.contains(&self) {
+            Some(match self {
+                Backend::Thunderstore => format!(
+                    "https://thunderstore.io/c/{}/api/v1/package-listing-index/",
+                    game.slug
+                ),
+                Backend::SleepyMiles => format!("{SITE_URL}api/v1/package-listing-index.gz"),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn force_cache_markdown(self) -> bool {
+        matches!(self, Backend::Thunderstore)
+    }
+
+    pub fn markdown_url(self, ident: &VersionIdent, cache: MarkdownKind) -> String {
+        match self {
+            Backend::Thunderstore => format!(
+                "https://thunderstore.io/api/experimental/package/{}/{}/{}/{}/",
+                ident.owner(),
+                ident.name(),
+                ident.version(),
+                cache
+            ),
+            Backend::SleepyMiles => format!(
+                "{SITE_URL}api/v1/markdown/{}/{}/{}.json",
+                ident.name(),
+                ident.version(),
+                cache
+            ),
+        }
+    }
+
+    pub fn owner_url(self, owner: &str, game: Game) -> String {
+        match self {
+            Backend::Thunderstore => {
+                format!("https://thunderstore.io/c/{}/p/{}/", game.slug, owner)
+            }
+            Backend::SleepyMiles => {
+                let _ = (owner, game);
+                SITE_URL.to_string()
+            }
+        }
+    }
+
+    pub fn mod_url(self, package: &PackageIdent, game: Game) -> String {
+        match self {
+            Backend::Thunderstore => {
+                format!(
+                    "https://thunderstore.io/c/{}/p/{}/{}/",
+                    game.slug,
+                    package.name(),
+                    package.name()
+                )
+            }
+            Backend::SleepyMiles => {
+                let _ = game;
+                format!("{SITE_URL}#mod-{}", package.name())
+            }
+        }
+    }
+
+    pub fn download_url(self, version: &VersionIdent) -> String {
+        match self {
+            Backend::Thunderstore => format!(
+                "https://thunderstore.io/package/download/{}/{}/{}",
+                version.owner(),
+                version.name(),
+                version.version()
+            ),
+            Backend::SleepyMiles => format!(
+                "{SITE_RELEASES_URL}{name}-{ver}/{name}-{ver}.zip",
+                name = version.name(),
+                ver = version.version()
+            ),
+        }
+    }
+
+    pub fn profile_import(self, key: &str) -> String {
+        match self {
+            Backend::Thunderstore => {
+                format!("https://thunderstore.io/api/experimental/legacyprofile/get/{key}/")
+            }
+            Backend::SleepyMiles => {
+                format!("https://thunderstore.io/api/experimental/legacyprofile/get/{key}/")
+            }
+        }
+    }
+
+    pub fn profile_export(self) -> &'static str {
+        match self {
+            Backend::Thunderstore => {
+                "https://thunderstore.io/api/experimental/legacyprofile/create/"
+            }
+            Backend::SleepyMiles => "https://thunderstore.io/api/experimental/legacyprofile/create/",
+        }
+    }
+
+    pub fn category_url(&self, game: Game) -> String {
+        match self {
+            Backend::Thunderstore => format!(
+                "https://thunderstore.io/api/experimental/community/{}/category/",
+                game.slug
+            ),
+            Backend::SleepyMiles => {
+                let _ = game;
+                format!("{SITE_URL}api/v1/categories.json")
+            }
+        }
+    }
+
+    pub fn modpack_upload_base_url(self) -> &'static str {
+        match self {
+            Backend::Thunderstore => "https://thunderstore.io/api/experimental",
+            Backend::SleepyMiles => "https://thunderstore.io/api/experimental",
+        }
+    }
+}
+
+/// Registry for all Thunderstore-like mods for the active game (SleepyMiles, Thunderstore).
+pub struct ThunderstoreBackend {
+    /// Whether packages have been succesfully fetched at least one since
+    /// the last call to [`crate::thunderstore::Thunderstore::switch_game`].
+    pub(super) packages_fetched: bool,
+    /// Whether a [`fetch_mods`] task is currently running.
+    is_fetching: bool,
+    // IndexMap is not used for ordering here, but for fast iteration,
+    // since we iterate over all mods when resolving identifiers and querying.
+    pub(super) packages: IndexMap<Uuid, PackageListing>,
+    pub(super) backend: Backend,
+}
+
+impl ThunderstoreBackend {
+    pub fn new(backend: Backend) -> Self {
+        Self {
+            packages_fetched: false,
+            is_fetching: false,
+            packages: IndexMap::new(),
+            backend,
+        }
+    }
+
+    /// Whether packages have been succesfully fetched at least one since
+    /// the last call to [`crate::thunderstore::Thunderstore::switch_game`].
+    pub fn packages_fetched(&self) -> bool {
+        self.packages_fetched
+    }
+
+    /// Returns an iterator over the latest versions of every package.
+    pub fn latest(&self) -> impl Iterator<Item = BorrowedMod<'_>> {
+        self.packages.values().map(move |package| BorrowedMod {
+            package,
+            version: package.latest_released(),
+        })
+    }
+
+    pub fn get_package(&self, uuid: Uuid) -> eyre::Result<&PackageListing> {
+        self.packages
+            .get(&uuid)
+            .ok_or_else(|| eyre!("package with id {uuid} not found"))
+    }
+
+    /// Finds a package with the given `full_name` (formatted as `owner-name`).
+    pub fn find_package(&self, full_name: &str) -> eyre::Result<&PackageListing> {
+        self.packages
+            .values()
+            .find(|package| package.ident.as_str() == full_name)
+            .ok_or_else(|| eyre!("package {full_name} not found"))
+    }
+
+    pub fn get_mod(&self, package_uuid: Uuid, version_uuid: Uuid) -> eyre::Result<BorrowedMod<'_>> {
+        let package = self.get_package(package_uuid)?;
+        let version = package.get_version(version_uuid).ok_or_else(|| {
+            eyre!(
+                "version with id {version_uuid} not found in package {}",
+                package.ident
+            )
+        })?;
+
+        Ok((package, version).into())
+    }
+
+    pub fn find_ident(&self, ident: &VersionIdent) -> eyre::Result<BorrowedMod<'_>> {
+        self.find_mod(ident.owner(), ident.name(), ident.version())
+    }
+
+    pub fn find_mod<'a>(
+        &'a self,
+        owner: &str,
+        name: &str,
+        version: &str,
+    ) -> eyre::Result<BorrowedMod<'a>> {
+        let package = self
+            .packages
+            .values()
+            .find(|package| package.owner() == owner && package.name() == name)
+            .ok_or_else(|| eyre!("package {}-{} not found", owner, name))?;
+
+        let version = package.get_version_with_num(version).ok_or_else(|| {
+            eyre!(
+                "version {} not found in package {}-{}",
+                version,
+                owner,
+                name
+            )
+        })?;
+
+        Ok((package, version).into())
+    }
+
+    /// Clear the package map.
+    pub fn clear_packages(&mut self) {
+        self.is_fetching = false;
+        self.packages_fetched = false;
+        self.packages = IndexMap::new();
+    }
+}

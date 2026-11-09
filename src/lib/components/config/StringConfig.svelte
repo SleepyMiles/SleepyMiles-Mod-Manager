@@ -1,0 +1,60 @@
+<script lang="ts">
+	import { setConfigEntry } from '$lib/config';
+	import type { ConfigEntryId, ConfigValue } from '$lib/types';
+
+	import ResetConfigButton from './ResetConfigButton.svelte';
+	import Icon from '@iconify/svelte';
+	import InputField from '$lib/components/ui/InputField.svelte';
+	import { getListSeparator } from '$lib/util';
+	import { config } from '$lib/state/misc.svelte';
+
+	type Props = {
+		entryId: ConfigEntryId;
+		locked: boolean;
+	};
+
+	let { entryId, locked }: Props = $props();
+
+	// svelte-ignore state_referenced_locally (local editing state seeded from prop)
+	let content = $state(entryId.entry.value.content as string);
+	let listSeparator = $derived(getListSeparator(entryId.entry));
+
+	async function onReset(value: ConfigValue) {
+		content = value.content as string;
+		await submit();
+	}
+
+	async function submit() {
+		await setConfigEntry(entryId, {
+			type: 'string',
+			content
+		});
+	}
+
+	let showExpandButton = $derived(
+		content.length > 100 ||
+			listSeparator.type === 'custom' ||
+			content.includes('\n') ||
+			content.includes(listSeparator.char)
+	);
+</script>
+
+<div class="relative grow">
+	<InputField
+		bind:value={content}
+		onchange={submit}
+		spellcheck="false"
+		disabled={locked}
+		class="w-full {showExpandButton && 'pr-8'}"
+	/>
+
+	{#if showExpandButton && !locked}
+		<button
+			class="text-primary-500 dark:bg-primary-900 dark:text-primary-400 dark:hover:bg-primary-800 bg-primary-100 hover:bg-primary-200 absolute top-1 right-1 rounded-lg p-1 text-lg"
+			onclick={() => (config.expandedEntry = entryId)}
+		>
+			<Icon icon="mdi:arrow-expand" />
+		</button>
+	{/if}
+</div>
+<ResetConfigButton {entryId} {locked} {onReset} />

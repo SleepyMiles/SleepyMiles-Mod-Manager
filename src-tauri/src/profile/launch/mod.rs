@@ -1,0 +1,363 @@
+use core::str;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use eyre::{Context, OptionExt, Result, bail, ensure, eyre};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tokio::time::Duration;
+use tracing::{info, warn};
+use walkdir::WalkDir;
+
+use super::ManagedGame;
+use crate::{
+    game::Game,
+    logger::log_webview_err,
+    prefs::{GamePrefs, Prefs},
+    util::{
+        self,
+        fs::{Overwrite, UseLinks},
+    },
+};
+
+mod custom_args;
+#[cfg(target_os = "linux")]
+mod linux;
+mod mod_loader;
+mod platform;
+
+pub mod commands;
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase", tag = "type", content = "content")]
+pub enum LaunchMode {
+    #[default]
+    #[serde(alias = "steam")]
+    Launcher,
+    #[serde(rename_all = "camelCase")]
+    Direct { instances: u32, interval_secs: f32 },
+}
+
+impl LaunchMode {
+    fn instances(&self) -> u32 {
+        match self {
+            LaunchMode::Launcher => 1,
+            LaunchMode::Direct { instances, .. } => *instances,
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        match self {
+            LaunchMode::Launcher => Duration::from_secs_f32(0.0),
+            LaunchMode::Direct { interval_secs, .. } => Duration::from_secs_f32(*interval_secs),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct LaunchOption {
+    pub arguments: String,
+    #[serde(rename = "type")]
+    pub launch_type: Option<String>,
+    pub description: Option<String>,
+}
+
+impl ManagedGame {
+    pub fn launch(&self, vanilla: bool, prefs: &Prefs, app: &AppHandle) -> Result<()> {
+        self.launch_with_args(vanilla, None, prefs, app)
+    }
+
+    pub fn launch_with_args(
+        &self,
+        vanilla: bool,
+        args: Option<String>,
+        prefs: &Prefs,
+        app: &AppHandle,
+    ) -> Result<()> {
+        let game_dir =
+            locate_game_dir(self.game, prefs).context("failed to locate game directory")?;
+
+        if !vanilla && let Err(err) = self.copy_required_files(&game_dir) {
+            warn!("failed to copy required files to game directory: {:#}", err);
+        }
+
+        let (launch_mode, mut command) = self.launch_command(vanilla, &game_dir, prefs)?;
+
+        if let Some(args) = args {
+            command.args(args.split_whitespace());
+        }
+
+        info!(game = %self.game.slug, ?command, "launching");
+
+        do_launch(command, app, launch_mode)?;
+
+        Ok(())
+    }
+
+    fn launch_command(
+        &self,
+        vanilla: bool,
+        game_dir: &Path,
+        prefs: &Prefs,
+    ) -> Result<(LaunchMode, Command)> {
+        let (launch_mode, mut platform, game_custom_args) =
+            prefs.game_prefs.get(&*self.game.slug).map_or_else(
+                || {
+                    info!("game prefs not set, using default settings");
+                    Default::default()
+                },
+                |prefs| {
+                    (
+                        prefs.launch_mode.clone(),
+                        prefs.platform,
+                        prefs.custom_args.as_str(),
+                    )
+                },
+            );
+
+        // if the game has a platform but the setting is unset, fill it in
+        platform = platform.or_else(|| self.game.platforms.iter().next());
+
+        let mut command = match (&launch_mode, platform) {
+            // If the setting is `Launcher` and we have a platform, use the platform-specific
+            // launch command (if there is one). Otherwise, fall back to direct execution.
+            (LaunchMode::Launcher, Some(platform)) => {
+                platform::create_launch_command(game_dir, platform, self.game, prefs).transpose()
+            }
+            _ => None,
+        }
+        .unwrap_or_else(|| find_executable(game_dir).map(Command::new))?;
+
+        let profile = self.active_profile();
+
+        #[cfg(target_os = "linux")]
+        let is_proton = !vanilla && {
+            use crate::game::platform::Platform;
+            use tracing::warn;
+
+            let is_proton = linux::is_proton(game_dir).unwrap_or_else(|err| {
+                warn!("failed to determine if game uses proton: {:#}", err);
+                false
+            });
+
+            if is_proton && let Some(proxy_dll) = self.game.mod_loader.proxy_dll() {
+                command.env("WINEDLLOVERRIDES", format!("{proxy_dll}=n,b"));
+
+                if let Some(steam) = &self.game.platforms.steam
+                    && matches!(platform, Some(Platform::Steam))
+                    && let Err(err) = linux::ensure_wine_override(steam.id, proxy_dll, game_dir)
+                {
+                    warn!("failed to ensure wine dll override: {:#}", err);
+                }
+            }
+
+            is_proton
+        };
+
+        #[cfg(target_os = "windows")]
+        let is_proton = false;
+
+        if is_proton {
+            info!("game appears to be running under proton, using proton launch method");
+        }
+
+        let mut ctx = mod_loader::ArgsContext::new(&mut command, &profile.path, is_proton, vanilla);
+        ctx.add_args(&self.game.mod_loader)?;
+
+        custom_args::add_args(&mut command, game_custom_args)?;
+        custom_args::add_args(&mut command, &profile.custom_args)?;
+
+        if matches!(launch_mode, LaunchMode::Direct { .. }) {
+            command.current_dir(game_dir);
+        }
+
+        Ok((launch_mode, command))
+    }
+
+    fn copy_required_files(&self, game_dir: &Path) -> Result<()> {
+        const INCLUDE_DIRS: [&str; 2] = ["doorstop_libs", "dotnet"];
+        const EXCLUDES: [&str; 2] = ["profile.json", "mods.yml"];
+
+        let target_dir = game_dir.join(self.game.mod_loader.file_target.unwrap_or("."));
+        ensure!(
+            target_dir.exists(),
+            "target directory for mod loader files does not exist at {}, please check your settings",
+            target_dir.display()
+        );
+
+        let entries = self
+            .active_profile()
+            .path
+            .read_dir()?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+
+                if EXCLUDES.iter().any(|exclude| name == *exclude) {
+                    return false;
+                }
+
+                let is_file = entry.file_type().is_ok_and(|ty| ty.is_file());
+                let is_included_dir = INCLUDE_DIRS.iter().any(|dir| *dir == name);
+
+                is_file || is_included_dir
+            });
+
+        for entry in entries {
+            let to_path = target_dir.join(entry.file_name());
+            info!(
+                file_name = %entry.file_name().to_string_lossy(),
+                to_path = %to_path.display(),
+                "copying to game directory",
+            );
+
+            if entry.file_type()?.is_file() {
+                fs::copy(entry.path(), to_path)?;
+            } else {
+                util::fs::copy_dir(entry.path(), to_path, Overwrite::Yes, UseLinks::No)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn do_launch(mut command: Command, app: &AppHandle, mode: LaunchMode) -> Result<()> {
+    match mode.instances() {
+        0 => bail!("instances must be greater than 0"),
+        1 => {
+            command.spawn()?;
+        }
+        instances => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                for i in 0..instances {
+                    if let Err(err) = command.spawn() {
+                        log_webview_err(
+                            "Failed to launch game",
+                            eyre!("Launch command {} failed: {}.", i, err),
+                            &app,
+                        );
+                    }
+                    tokio::time::sleep(mode.interval()).await;
+                }
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn locate_game_dir(game: Game, prefs: &Prefs) -> Result<PathBuf> {
+    let game_prefs = prefs.game_prefs.get(&*game.slug);
+
+    let path = if let Some(GamePrefs {
+        dir_override: Some(path),
+        ..
+    }) = game_prefs
+    {
+        info!("using game directory override at {}", path.display());
+        path.clone()
+    } else {
+        let platform = game_prefs
+            .and_then(|prefs| prefs.platform)
+            .or_else(|| game.platforms.iter().next());
+
+        let path = platform::locate_game_dir(platform, game)?;
+        info!(
+            "found game directory via platform ({}): {}",
+            match &platform {
+                Some(platform) => platform.as_ref(),
+                None => "none",
+            },
+            path.display()
+        );
+        path
+    };
+
+    ensure!(
+        path.exists(),
+        "game directory does not exist, please check your settings (expected at {})",
+        path.display()
+    );
+
+    Ok(path)
+}
+
+const IGNORED_EXES: &[&str] = &[
+    "crashpad_handler.exe",
+    "UnityCrashHandler32.exe",
+    "UnityCrashHandler64.exe",
+];
+
+fn find_executable(game_dir: &Path) -> Result<PathBuf> {
+    WalkDir::new(game_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .sorted_by(|a, b| a.depth().cmp(&b.depth())) // prefer shallower entries
+        .find(|entry| {
+            let file_name = PathBuf::from(entry.file_name());
+            let file_name_str = file_name.to_string_lossy();
+            let extension = file_name.extension().and_then(|ext| ext.to_str());
+
+            let has_correct_extension = if cfg!(windows) {
+                matches!(extension, Some("exe"))
+            } else {
+                matches!(extension, Some("exe" | "sh"))
+            };
+
+            has_correct_extension && !IGNORED_EXES.contains(&&*file_name_str)
+        })
+        .map(walkdir::DirEntry::into_path)
+        .ok_or_eyre("game executable not found")
+}
+
+pub fn parse_steam_launch_options(steam_id: u32) -> Result<Vec<LaunchOption>> {
+    let raw_options = platform::get_steam_launch_options(steam_id)
+        .context("failed to get Steam launch options")?;
+
+    let mut launch_options = Vec::new();
+
+    if let Some(options_obj) = raw_options.as_object() {
+        for (_, option_value) in options_obj {
+            if let Some(option) = option_value.as_object() {
+                // TODO: Figure out how to properly filter by active beta branch.
+                // Need to find where Steam stores info about which beta branch is active for an app.
+                if let Some(config) = option.get("config")
+                    && config.get("BetaKey").is_some()
+                {
+                    continue;
+                }
+
+                let launch_type = option
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(std::string::ToString::to_string);
+
+                let arguments = option
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let description = option
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(std::string::ToString::to_string);
+
+                launch_options.push(LaunchOption {
+                    arguments,
+                    launch_type,
+                    description,
+                });
+            }
+        }
+    }
+
+    Ok(launch_options)
+}

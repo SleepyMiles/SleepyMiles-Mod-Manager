@@ -1,0 +1,24 @@
+<script lang="ts">
+	import { Menubar } from 'bits-ui';
+	import type { Snippet } from 'svelte';
+
+	type Props = {
+		label: string;
+		children?: Snippet;
+	};
+
+	let { label, children }: Props = $props();
+</script>
+
+<Menubar.Menu>
+	<Menubar.Trigger
+		class="text-primary-500 hover:text-primary-800 dark:text-primary-400 dark:hover:bg-primary-700 dark:hover:text-primary-200 hover:bg-primary-200 -mx-px h-full cursor-default rounded-sm px-3 text-sm"
+	>
+		{label}
+	</Menubar.Trigger>
+	<Menubar.Content
+		class="border-primary-300 dark:border-primary-600 dark:bg-primary-800 z-50 mt-0.5 flex flex-col gap-0.5 rounded-lg border bg-white py-1 shadow-xl"
+	>
+		{@render children?.()}
+	</Menubar.Content>
+</Menubar.Menu>

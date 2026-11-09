@@ -1,0 +1,400 @@
+use std::{borrow::Cow, env, fmt::Display, io::Cursor, sync::LazyLock};
+
+use chrono::{DateTime, Utc};
+use eyre::{Context, OptionExt, Result, bail, eyre};
+use reqwest::{Method, StatusCode};
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+
+use crate::{
+    profile::{import::ImportOptions, install::InstallOptions},
+    state::ManagerExt,
+};
+
+pub mod auth;
+pub mod commands;
+pub mod socket;
+
+static API_URL: LazyLock<Cow<'static, str>> = LazyLock::new(|| match env::var("GALE_SYNC_URL") {
+    Ok(var) => var.into(),
+    Err(_) => "https://gale.kesomannen.com/api".into(),
+});
+
+async fn request(
+    method: Method,
+    path: impl Display,
+    app: &AppHandle,
+) -> reqwest_middleware::RequestBuilder {
+    let url = format!("{}{path}", *API_URL);
+
+    let mut req = app.http().request(method, url);
+    if let Some(token) = auth::access_token(app).await {
+        req = req.bearer_auth(token);
+    }
+    req
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSyncProfileResponse {
+    id: String,
+    #[allow(unused)]
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProfileMetadata {
+    id: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    owner: auth::User,
+    manifest: super::export::ProfileManifest,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProfileData {
+    id: String,
+    owner: auth::User,
+    synced_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub missing: bool,
+    #[serde(default)]
+    preserve_extras: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FullUserInfo {
+    #[serde(flatten)]
+    user: auth::User,
+    profiles: Option<Vec<ListedSyncProfile>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedSyncProfile {
+    id: String,
+    name: String,
+    community: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<SyncProfileMetadata> for SyncProfileData {
+    fn from(value: SyncProfileMetadata) -> Self {
+        SyncProfileData {
+            id: value.id,
+            owner: value.owner,
+            synced_at: value.updated_at,
+            updated_at: value.updated_at,
+            missing: false,
+            preserve_extras: false,
+        }
+    }
+}
+
+enum Upload {
+    Success(CreateSyncProfileResponse),
+    TooLarge { size: usize },
+}
+
+async fn create_profile(app: &AppHandle) -> Result<Upload> {
+    let Some(user) = auth::user_info(app) else {
+        bail!("not logged in");
+    };
+
+    let profile_id = {
+        let manager = app.lock_manager();
+        manager.active_profile().id
+    };
+
+    let writer = Cursor::new(Vec::new());
+    let bytes = super::export::export_zip(app, profile_id, writer)
+        .await
+        .context("failed to export profile")?
+        .into_inner();
+
+    let upload = upload_profile_file(app, bytes, Method::POST, "/profile").await?;
+
+    match &upload {
+        Upload::Success(response) => {
+            let mut manager = app.lock_manager();
+            let profile = manager.active_profile_mut();
+
+            let id = response.id.clone();
+
+            profile.sync = Some(SyncProfileData {
+                id,
+                owner: user,
+                synced_at: response.updated_at,
+                updated_at: response.updated_at,
+                missing: false,
+                preserve_extras: false,
+            });
+
+            profile.save(app, true)?;
+        }
+        Upload::TooLarge { .. } => (),
+    }
+
+    Ok(upload)
+}
+
+async fn push_profile(app: &AppHandle) -> Result<Upload> {
+    let (sync_id, profile_id) = {
+        let manager = app.lock_manager();
+        let profile = manager.active_profile();
+
+        let sync_id = profile
+            .sync
+            .as_ref()
+            .map(|data| data.id.clone())
+            .ok_or_eyre("profile is not synced")?;
+
+        (sync_id, profile.id)
+    };
+
+    let writer = Cursor::new(Vec::new());
+    let bytes = super::export::export_zip(app, profile_id, writer)
+        .await
+        .context("failed to export profile")?
+        .into_inner();
+
+    let upload: Upload =
+        upload_profile_file(app, bytes, Method::PUT, format!("/profile/{sync_id}")).await?;
+
+    match &upload {
+        Upload::Success(response) => {
+            let mut manager = app.lock_manager();
+            let (_, profile) = manager.profile_by_id_mut(profile_id)?;
+            let sync_data = profile.sync.as_mut().unwrap();
+
+            sync_data.synced_at = response.updated_at;
+            sync_data.updated_at = response.updated_at;
+
+            profile.save(app, true)?;
+        }
+        Upload::TooLarge { .. } => (),
+    }
+
+    Ok(upload)
+}
+
+async fn upload_profile_file(
+    app: &AppHandle,
+    bytes: Vec<u8>,
+    method: Method,
+    endpoint: impl Display,
+) -> Result<Upload> {
+    let size = bytes.len();
+    let res = request(method, endpoint, app)
+        .await
+        .body(bytes)
+        .send()
+        .await?;
+
+    if res.status().is_success() {
+        let response = res.json().await?;
+        Ok(Upload::Success(response))
+    } else if res.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        Ok(Upload::TooLarge { size })
+    } else {
+        bail!("upload failed with status: {}", res.status());
+    }
+}
+
+async fn disconnect_profile(delete: bool, app: &AppHandle) -> Result<()> {
+    let (id, is_owner) = {
+        let mut manager = app.lock_manager();
+        let profile = manager.active_profile_mut();
+
+        let (id, owner_discord_id) = profile
+            .sync
+            .as_ref()
+            .map(|info| (info.id.clone(), &info.owner.discord_id))
+            .ok_or_eyre("profile is not synced")?;
+
+        let is_owner =
+            auth::user_info(app).is_some_and(|user| user.discord_id == *owner_discord_id);
+
+        (id, is_owner)
+    };
+
+    if is_owner && delete {
+        delete_profile(&id, app).await?;
+    }
+
+    {
+        let mut manager = app.lock_manager();
+        let profile = manager.active_profile_mut();
+
+        profile.sync = None;
+
+        profile.save(app, true)?;
+    }
+
+    Ok(())
+}
+
+async fn clone_profile(id: &str, override_name: Option<String>, app: &AppHandle) -> Result<()> {
+    let metadata = read_profile(id, app).await?;
+
+    download_and_import_file(override_name, metadata.into(), app).await
+}
+
+pub async fn pull_profile(dry_run: bool, app: &AppHandle) -> Result<()> {
+    let (id, profile_id, name, synced_at, preserve_extras) = {
+        let mut manager = app.lock_manager();
+        let profile = manager.active_profile_mut();
+
+        match &profile.sync {
+            Some(data) if data.missing => bail!("cannot pull from missing profile"),
+            Some(data) => (
+                data.id.clone(),
+                profile.id,
+                profile.name.clone(),
+                data.synced_at,
+                data.preserve_extras,
+            ),
+            None => return Ok(()),
+        }
+    };
+
+    let metadata = get_profile_meta(&id, app).await?;
+
+    match metadata {
+        Some(metadata) if !dry_run && metadata.updated_at > synced_at => {
+            let mut sync_profile: SyncProfileData = metadata.into();
+            sync_profile.preserve_extras = preserve_extras;
+
+            download_and_import_file(Some(name), sync_profile, app).await
+        }
+        metadata => {
+            let mut manager = app.lock_manager();
+            let (_, profile) = manager.profile_by_id_mut(profile_id)?;
+
+            let Some(sync) = profile.sync.as_mut() else {
+                return Ok(());
+            };
+
+            match metadata {
+                Some(metadata) => {
+                    *sync = SyncProfileData {
+                        synced_at: sync.synced_at,
+                        preserve_extras: sync.preserve_extras,
+                        ..metadata.into()
+                    };
+                }
+                None => sync.missing = true,
+            }
+
+            profile.save(app, true)?;
+
+            Ok(())
+        }
+    }
+}
+
+async fn download_and_import_file(
+    override_name: Option<String>,
+    sync_profile: SyncProfileData,
+    app: &AppHandle,
+) -> Result<()> {
+    let path = format!("/profile/{}", sync_profile.id);
+    let bytes = request(Method::GET, path, app)
+        .await
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let mut data = super::import::read_file(Cursor::new(bytes), &app.lock_thunderstore())
+        .context("failed to read profile")?;
+
+    if let Some(name) = override_name {
+        data.manifest.name = name;
+    }
+
+    let preserve_extras = sync_profile.preserve_extras;
+    let id = super::import::import_profile(
+        data,
+        ImportOptions::default()
+            .ignore_missing_mods(true)
+            .merge(preserve_extras),
+        InstallOptions::default(),
+        app,
+    )
+    .await
+    .context("failed to import profile")?;
+
+    {
+        let mut manager = app.lock_manager();
+        let (_, profile) = manager.profile_by_id_mut(id)?;
+
+        profile.sync = Some(sync_profile);
+        profile.save(app, true)?;
+    }
+
+    Ok(())
+}
+
+fn set_preserve_extras(preserve_extras: bool, app: &AppHandle) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let profile = manager.active_profile_mut();
+    let sync = profile.sync.as_mut().ok_or_eyre("profile is not synced")?;
+
+    sync.preserve_extras = preserve_extras;
+    profile.save(app, true)?;
+
+    Ok(())
+}
+
+async fn delete_profile(id: &str, app: &AppHandle) -> Result<()> {
+    request(Method::DELETE, format!("/profile/{id}"), app)
+        .await
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(())
+}
+
+async fn get_profile_meta(id: &str, app: &AppHandle) -> Result<Option<SyncProfileMetadata>> {
+    let res = request(Method::GET, format!("/profile/{id}/meta"), app)
+        .await
+        .send()
+        .await?
+        .error_for_status();
+
+    match res {
+        Ok(res) => {
+            let res = res.json().await?;
+            Ok(Some(res))
+        }
+        Err(err) if err.status() == Some(StatusCode::NOT_FOUND) => Ok(None),
+        Err(err) => Err(eyre!(err)),
+    }
+}
+
+pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetadata> {
+    get_profile_meta(id, app)
+        .await?
+        .ok_or_eyre("profile not found")
+}
+
+async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {
+    let user: FullUserInfo = request(Method::GET, "/user/me", app)
+        .await
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    Ok(user.profiles.unwrap_or_default())
+}
