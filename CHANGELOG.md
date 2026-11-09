@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4
+
+- New app icon in the style of SleepyMiles' mod posters, and a matching small icon next to the File menu.
+
 ## 1.0.3
 
 - New default colors: Neutral (primary) and Amber (accent).
