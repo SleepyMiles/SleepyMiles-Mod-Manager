@@ -35,7 +35,7 @@ const BUNDLED_GAMES_JSON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR")
 
 const BUILD_TIME: &str = env!("BUILD_TIME");
 
-// SleepyMiles Mod Manager only supports Lethal Company, so it always uses the bundled list and never
+// Miles Mod Manager only supports Lethal Company, so it always uses the bundled list and never
 // downloads Gale's full games list (which would bring back every other game).
 const USE_REMOTE_GAMES_LIST: bool = false;
 

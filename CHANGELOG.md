@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.9
+
+- Renamed to **Miles Mod Manager**. The program is now `Miles.exe` and the desktop and Start menu shortcuts are called **Miles**.
+- New icon: the wooden crate with the MILES label, the tools and Miles himself. It shows on the taskbar, shortcuts, window, menu bar and About dialog.
+- Updating from 1.0.8 or older moves you over automatically: your profiles, settings and GitHub login stay, the old shortcuts are replaced with "Miles" ones, a taskbar pin keeps working, and the old SleepyMiles Mod Manager program folder is removed.
+
 ## 1.0.8
 
 - Window title, desktop shortcuts and messages say SleepyMiles Mod Manager instead of Gale.

@@ -85,7 +85,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn create_http_client() -> Result<reqwest_middleware::ClientWithMiddleware> {
     let base = reqwest::Client::builder()
-        .user_agent(concat!("SleepyMiles-ModManager/", env!("CARGO_PKG_VERSION"), " (based on Gale)"))
+        .user_agent(concat!("MilesModManager/", env!("CARGO_PKG_VERSION"), " (based on Gale)"))
         // without these, a stalled connection would hang the request (and thus the
         // install queue) indefinitely, instead of failing so that we can retry it
         .connect_timeout(CONNECT_TIMEOUT)

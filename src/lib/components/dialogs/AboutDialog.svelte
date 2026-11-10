@@ -31,7 +31,7 @@
 	<div class="h-3"></div>
 	<img src="logo.png" alt="Logo" class="float-right size-20" />
 	<div>
-		<h3 class="text-primary-900 text-xl font-semibold dark:text-white">SleepyMiles Mod Manager</h3>
+		<h3 class="text-primary-900 text-xl font-semibold dark:text-white">Miles Mod Manager</h3>
 		<p class="text-primary-600 dark:text-primary-300">
 			{m.aboutDialog_version({ version: version })}
 			<br />

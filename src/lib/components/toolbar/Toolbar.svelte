@@ -12,7 +12,7 @@
 	<GameSelectButton />
 	<div class="border-primary-200 dark:border-primary-700 mx-2 h-full border-r"></div>
 	<ProfilesDropdown />
-	<!-- Profile sync needs Gale's server, so it is turned off in SleepyMiles Mod Manager. Use profile codes. -->
+	<!-- Profile sync needs Gale's server, so it is turned off in Miles Mod Manager. Use profile codes. -->
 	<InstallPopover />
 	<Updater />
 </div>

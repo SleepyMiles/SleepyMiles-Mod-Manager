@@ -44,13 +44,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             let hint = if text.contains("os error 5)") || text.contains("os error 161)") {
                 "\n\nWindows wouldn't let the app create its folders. This is usually antivirus \
                  (for example Norton CyberCapture) holding a new app in its sandbox: allow \
-                 SleepyMiles Mod Manager in your antivirus, then open it again."
+                 Miles Mod Manager in your antivirus, then open it again."
             } else {
                 ""
             };
 
             app.dialog()
-                .message(format!("Failed to launch SleepyMiles Mod Manager: {text}{hint}"))
+                .message(format!("Failed to launch Miles Mod Manager: {text}{hint}"))
                 .blocking_show();
         }
 

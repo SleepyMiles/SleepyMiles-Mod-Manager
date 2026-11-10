@@ -87,7 +87,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
           tagName: v${{ steps.version.outputs.version }}
-          releaseName: SleepyMiles Mod Manager ${{ steps.version.outputs.version }}
+          releaseName: Miles Mod Manager ${{ steps.version.outputs.version }}
           releaseBody: |
             Download **SleepyMiles.Mod.Manager_${{ steps.version.outputs.version }}_x64-setup.exe** below and run it.
             Already installed? The app updates itself.

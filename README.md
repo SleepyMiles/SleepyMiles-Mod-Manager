@@ -1,4 +1,4 @@
-# SleepyMiles Mod Manager
+# Miles Mod Manager
 
 A Lethal Company mod manager that gets mods from [Thunderstore](https://thunderstore.io/c/lethal-company/) **and** from [SleepyMiles' mod site](https://sleepymiles.github.io/miles-lc-mods/), for mods that can't go on Thunderstore.
 

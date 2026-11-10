@@ -420,7 +420,7 @@ async fn publish(path: &Path, app: &AppHandle) -> Result<String> {
 
     // 1. Draft release, so the site's workflow doesn't start before the zip is attached.
     let body = format!(
-        "{}\n\nPublished from SleepyMiles Mod Manager.",
+        "{}\n\nPublished from Miles Mod Manager.",
         if info.description.is_empty() { &info.name } else { &info.description }
     );
     let response = github(app, reqwest::Method::POST, &format!("{API}/repos/{REPO}/releases"), &token)

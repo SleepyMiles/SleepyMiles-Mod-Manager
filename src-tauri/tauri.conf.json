@@ -1,5 +1,5 @@
 {
-	"productName": "SleepyMiles Mod Manager",
+	"productName": "Miles",
 	"version": "1.0.0",
 	"identifier": "com.sleepymiles.modmanager",
 	"build": {
@@ -28,7 +28,8 @@
 		],
 		"windows": {
 			"nsis": {
-				"installMode": "currentUser"
+				"installMode": "currentUser",
+				"installerHooks": "./installer-hooks.nsh"
 			}
 		},
 		"linux": {
@@ -84,7 +85,7 @@
 				"fullscreen": false,
 				"transparent": false,
 				"resizable": true,
-				"title": "SleepyMiles Mod Manager",
+				"title": "Miles Mod Manager",
 				"width": 900,
 				"height": 700,
 				"minWidth": 800,
@@ -102,5 +103,5 @@
 			}
 		}
 	},
-	"mainBinaryName": "SleepyMilesModManager"
+	"mainBinaryName": "Miles"
 }
