@@ -50,8 +50,10 @@ struct SectionInfo {
 }
 
 impl SectionInfo {
+    /// Without the padding. LethalLevelLoader sorts its sections by putting zero-width spaces
+    /// (U+200B) in front of the names, which `trim()` doesn't count as whitespace.
     fn name(&self) -> &str {
-        self.raw_name.trim()
+        self.raw_name.trim_matches(|c: char| c.is_whitespace() || c == '\u{200b}' || c == '\u{feff}')
     }
 }
 
@@ -236,6 +238,8 @@ fn scan(profile: &Path) -> Result<CleanupScan> {
     let dead_files: HashSet<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
 
     // 2. LethalLevelLoader's dungeons and moons
+    let mut live_content: HashSet<String> = HashSet::new();
+    let mut dead_content: HashSet<String> = HashSet::new();
     for (path, _, info) in &cfgs {
         let r = rel(profile, path);
         if dead_files.contains(r.as_str()) || !path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(LLL_FILE)) {
@@ -252,6 +256,16 @@ fn scan(profile: &Path) -> Result<CleanupScan> {
             continue;
         }
         if binding_ran {
+            for s in &info.sections {
+                if starts(s, LLL_BINDING_SECTIONS) {
+                    let name = content_name(s.name());
+                    if s.bound > 0 {
+                        live_content.insert(name);
+                    } else {
+                        dead_content.insert(name);
+                    }
+                }
+            }
             out.sections.extend(candidates.into_iter().map(|s| UnusedSection {
                 path: r.clone(),
                 section: s.name().to_owned(),
@@ -266,8 +280,42 @@ fn scan(profile: &Path) -> Result<CleanupScan> {
         }
     }
 
+    // 3. JLL makes one small file per interior/moon ("BepInEx/config/JLL/Magic Wesley.Toy Store.cfg")
+    //    without a plugin header. It's only called unused when LethalLevelLoader (checked above,
+    //    after a lobby session) shows that same interior or moon as removed and nothing live has
+    //    that name.
+    for (path, _, info) in &cfgs {
+        if info.guid.is_some() {
+            continue;
+        }
+        let in_jll = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n.eq_ignore_ascii_case("JLL"));
+        let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        let Some((author, content)) = stem.split_once('.') else { continue };
+        let key = content.trim().to_lowercase();
+        if in_jll && dead_content.contains(&key) && !live_content.contains(&key) {
+            out.files.push(UnusedFile {
+                path: rel(profile, path),
+                plugin: format!("JLL settings for {} ({})", content.trim(), author.trim()),
+                size: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            });
+        }
+    }
+
     out.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// "Custom Dungeon:  Toy Store" -> "toy store", "Custom Level:  240 Alcatras" -> "alcatras".
+fn content_name(section: &str) -> String {
+    let rest = section.split_once(':').map(|(_, r)| r).unwrap_or(section).trim();
+    let rest = match rest.split_once(' ') {
+        Some((num, name)) if section.contains("Level:") && num.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => rest,
+    };
+    rest.trim().to_lowercase()
 }
 
 fn active_profile(app: &AppHandle) -> (String, PathBuf) {
@@ -403,26 +451,26 @@ mod tests {
     const LLL: &str = "## Settings file was created by plugin LethalLevelLoader v1.4.0\r\n\
 ## Plugin GUID: imabatby.lethallevelloader\r\n\
 \r\n\
-[     - LethalLevelLoader Settings -]\r\n\
+[\u{200b}\u{200b}\u{200b}\u{200b}\u{200b} - LethalLevelLoader Settings -]\r\n\
 \r\n\
 ## Controls debug\r\n\
 # Setting type: DebugType\r\n\
 # Default value: User\r\n\
 LethalLevelLoader Debugging Mode = User\r\n\
 \r\n\
-[       Vanilla Dungeon:  Facility (Level1Flow)]\r\n\
+[\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}Vanilla Dungeon:  Facility (Level1Flow)]\r\n\
 \r\n\
 # Setting type: Boolean\r\n\
 # Default value: false\r\n\
 General Settings - Enable Content Configuration = false\r\n\
 \r\n\
-[         Custom Dungeon:  Office]\r\n\
+[\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}Custom Dungeon:  Office]\r\n\
 \r\n\
 # Setting type: Boolean\r\n\
 # Default value: false\r\n\
 General Settings - Enable Content Configuration = true\r\n\
 \r\n\
-[         Custom Dungeon:  Toy Store]\r\n\
+[\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}Custom Dungeon:  Toy Store]\r\n\
 \r\n\
 General Settings - Enable Content Configuration = true\r\n\
 Dungeon Injection Settings - Manual Level Names List = Rend:300\r\n\
@@ -451,7 +499,7 @@ Dungeon Injection Settings - Manual Level Names List = Rend:300\r\n\
         assert!(!out.contains("Toy Store"));
         assert!(!out.contains("Rend:300"));
         assert!(out.contains("Custom Dungeon:  Office]\r\n"));
-        assert_eq!(out, LLL.split("[         Custom Dungeon:  Toy Store]").next().unwrap());
+        assert_eq!(out, LLL.split("[\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}\u{200b}Custom Dungeon:  Toy Store]").next().unwrap());
     }
 
     fn profile_with(name: &str, lll: &str, dll_text: &str) -> PathBuf {
@@ -488,6 +536,62 @@ Dungeon Injection Settings - Manual Level Names List = Rend:300\r\n\
         assert_eq!(sections, vec!["Custom Dungeon:  Toy Store"]);
         assert!(result.notes.is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Miles's real LethalLevelLoader.cfg (after a session that only reached the main menu),
+    /// if it's around: copied to /mnt/user-data/uploads/config/ for this test.
+    #[test]
+    fn real_file_after_main_menu_session() {
+        let Ok(real) = fs::read_to_string("/mnt/user-data/uploads/config/LethalLevelLoader.cfg") else { return };
+        let dir = profile_with("real", &real, "x");
+        let result = scan(&dir).unwrap();
+        assert!(result.sections.is_empty(), "nothing may be removed after a menu-only session");
+        assert_eq!(result.notes.len(), 1);
+
+        // pretend a lobby loaded: everything bound except Toy Store and Alcatras
+        let mut lobby = String::new();
+        let mut current = String::new();
+        for line in real.split_inclusive('\n') {
+            if let Some(h) = section_header(line) {
+                current = h.to_owned();
+            }
+            let t = line.trim_start();
+            let dead = current.contains("Toy Store") || current.contains("Alcatras");
+            if !dead && !t.starts_with('#') && !t.starts_with('[') && t.contains('=') {
+                lobby.push_str("# Setting type: Boolean\r\n");
+            }
+            lobby.push_str(line);
+        }
+        let dir2 = profile_with("real2", &lobby, "x");
+        fs::create_dir_all(dir2.join("BepInEx/config/JLL")).unwrap();
+        for f in ["Magic Wesley.Toy Store.cfg", "MagicWesley.Alcatras.cfg", "MagicWesley.Polarus.cfg", "Magic Wesley.Hallowed content.cfg"] {
+            fs::write(dir2.join("BepInEx/config/JLL").join(f), "[A]\nX = 1\n").unwrap();
+        }
+        let result = scan(&dir2).unwrap();
+        let mut sections: Vec<_> = result.sections.iter().map(|s| s.section.as_str()).collect();
+        sections.sort();
+        assert_eq!(sections, vec!["Custom Dungeon:  Toy Store", "Custom Level:  240 Alcatras"]);
+        let files: Vec<_> = result.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                "BepInEx/config/JLL/Magic Wesley.Toy Store.cfg",
+                "BepInEx/config/JLL/MagicWesley.Alcatras.cfg",
+                "BepInEx/config/gone.mod.cfg"
+            ]
+        );
+        // LC Office and everything else stays
+        assert!(!result.sections.iter().any(|s| s.section.contains("LC Office")));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn content_names() {
+        assert_eq!(content_name("Custom Dungeon:  Toy Store"), "toy store");
+        assert_eq!(content_name("Custom Level:  240 Alcatras"), "alcatras");
+        assert_eq!(content_name("Custom Level:  End"), "end");
+        assert_eq!(content_name("Vanilla Dungeon:  Facility (Level1Flow)"), "facility (level1flow)");
     }
 
     #[test]

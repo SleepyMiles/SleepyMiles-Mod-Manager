@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.11
+
+- **Send logs** is now also on the upload page (cloud icon), above Miles's "Publish a mod" section.
+- **Unused config** in File → Free up space. It works on the open profile: click **Check**, untick anything you want to keep, then **Remove**. A backup of the config folder is saved first. It finds:
+  - config files of mods that are no longer in the profile (turned-off mods count as still there);
+  - LethalLevelLoader settings for interiors and moons you removed, and JLL's small per-interior files for them. LethalLevelLoader only fills these in once a lobby loads, so they're only checked after you've hosted or joined a lobby. Otherwise it tells you to do that first and removes nothing.
+
 ## 1.0.10
 
 - **Send logs to Miles** (File or Help menu): sends your BepInEx log, Lethal Company's Player.log (and the one from before the last restart), the app's log and your mod list straight to Miles's Discord, with your name and what happened. "Save as zip instead" puts the same zip in your Downloads folder.
