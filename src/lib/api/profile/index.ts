@@ -27,7 +27,8 @@ export const query = (args: QueryModsArgs) => invoke<ProfileQuery>('query_profil
 export const isModInstalled = (uuid: string) => invoke<boolean>('is_mod_installed', { uuid });
 export const create = (name: string, overridePath: string | null) =>
 	invoke('create_profile', { name, overridePath });
-export const deleteProfile = (profileId: number) => invoke('delete_profile', { id: profileId });
+export const deleteProfile = (profileId: number) =>
+	invoke<number>('delete_profile', { id: profileId });
 export const rename = (name: string) => invoke('rename_profile', { name });
 export const duplicate = (name: string) => invoke('duplicate_profile', { name });
 export const removeMod = (uuid: string) => invoke<ModActionResponse>('remove_mod', { uuid });

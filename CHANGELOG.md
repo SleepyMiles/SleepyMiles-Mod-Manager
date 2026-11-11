@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.10
+
+- **Send logs to Miles** (File or Help menu): sends your BepInEx log, Lethal Company's Player.log (and the one from before the last restart), the app's log and your mod list straight to Miles's Discord, with your name and what happened. "Save as zip instead" puts the same zip in your Downloads folder.
+- **Free up space** (File menu) replaces the two "Clear mod cache" items and shows what each option really frees:
+  - **Unused mod files**: old versions left after updates, uninstalled mods, mods from deleted profiles and leftover profile folders. Safe to delete.
+  - **Whole mod cache**: explained properly. Your profiles share these files, so it only frees the unused part, and mods download again next time.
+  - **Gale's leftover files**: deletes what Gale left behind after you switched. It warns you if Gale is still installed and won't run while Gale is open.
+- Deleting a profile now also deletes its mods' downloads when no other profile uses them, so the space is really freed, and tells you how much.
+
 ## 1.0.9
 
 - Renamed to **Miles Mod Manager**. The program is now `Miles.exe` and the desktop and Start menu shortcuts are called **Miles**.

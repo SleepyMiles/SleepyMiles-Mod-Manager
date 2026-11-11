@@ -5,6 +5,7 @@
 	import clsx from 'clsx';
 	import * as api from '$lib/api';
 	import { pushInfoToast } from '$lib/toast';
+	import { shortenFileSize } from '$lib/util';
 	import IconButton from '$lib/components/ui/IconButton.svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import profiles from '$lib/state/profile.svelte';
@@ -19,13 +20,18 @@
 	let isActive = $derived(profile.id === profiles.active?.id);
 
 	async function deleteProfile() {
-		let confirmed = await confirm(`Are you sure you want to delete ${profile.name}?`);
+		let confirmed = await confirm(
+			`Delete ${profile.name}? Its mods and configs are deleted too (mods other profiles use are kept).`
+		);
 		if (!confirmed) return;
 
-		await api.profile.deleteProfile(profile.id);
+		const freed = await api.profile.deleteProfile(profile.id);
 
 		pushInfoToast({
-			message: `Deleted profile ${profile.name}.`
+			message:
+				freed > 0
+					? `Deleted profile ${profile.name} and freed ${shortenFileSize(freed)}.`
+					: `Deleted profile ${profile.name}.`
 		});
 	}
 </script>

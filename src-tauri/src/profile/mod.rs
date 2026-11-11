@@ -290,7 +290,7 @@ impl Profile {
         self.get_mod(uuid).is_ok()
     }
 
-    fn thunderstore_mods(&self) -> impl Iterator<Item = (&ThunderstoreMod, bool)> {
+    pub(crate) fn thunderstore_mods(&self) -> impl Iterator<Item = (&ThunderstoreMod, bool)> {
         self.mods.iter().filter_map(ProfileMod::as_thunderstore)
     }
 
@@ -340,7 +340,7 @@ impl Profile {
             .filter(|dep| !self.has_mod(dep.package.uuid))
     }
 
-    fn log_path(&self) -> Result<PathBuf> {
+    pub(crate) fn log_path(&self) -> Result<PathBuf> {
         let mod_loader = &self.game.mod_loader;
         let relative = mod_loader
             .log_path()

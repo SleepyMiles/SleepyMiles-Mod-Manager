@@ -34,7 +34,7 @@ pub fn log_webview_err(name: impl AsRef<str>, error: eyre::Error, app: &AppHandl
     );
 }
 
-fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     util::path::default_app_data_dir().join(FILE_NAME)
 }
 

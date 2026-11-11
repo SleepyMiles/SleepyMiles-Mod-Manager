@@ -239,17 +239,31 @@ pub fn create_profile(name: String, override_path: Option<PathBuf>, app: AppHand
     Ok(())
 }
 
+/// Deletes a profile and the cached copies of its mods that no other profile uses, so the space is
+/// really freed. Returns the bytes freed.
 #[command]
-pub fn delete_profile(id: i64, app: AppHandle) -> Result<()> {
-    let mut manager = app.lock_manager();
-    let game = manager.active_game_mut();
+pub async fn delete_profile(id: i64, app: AppHandle) -> Result<u64> {
+    let plan_app = app.clone();
+    let (cache_dirs, cache, freed) =
+        tauri::async_runtime::spawn_blocking(move || crate::storage::profile_deletion_plan(&plan_app, id))
+            .await
+            .map_err(|e| eyre::eyre!(e))??;
 
-    game.delete_profile(id, false, app.db())?;
-    game.save(&app)?;
+    {
+        let mut manager = app.lock_manager();
+        let game = manager.active_game_mut();
 
-    game.update_window_title(&app)?;
+        game.delete_profile(id, false, app.db())?;
+        game.save(&app)?;
 
-    Ok(())
+        game.update_window_title(&app)?;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || crate::storage::finish_profile_deletion(cache_dirs, cache))
+        .await
+        .ok();
+
+    Ok(freed)
 }
 
 #[command]

@@ -16,6 +16,8 @@ mod logger;
 mod prefs;
 mod profile;
 mod site_upload;
+mod storage;
+mod send_logs;
 mod state;
 mod thunderstore;
 mod util;
@@ -145,6 +147,13 @@ pub fn run() {
             site_upload::site_login_poll,
             site_upload::site_account,
             site_upload::site_logout,
+            storage::storage_report,
+            storage::free_unused_space,
+            storage::clear_all_cache,
+            storage::delete_gale_leftovers,
+            send_logs::logs_info,
+            send_logs::send_logs,
+            send_logs::save_logs,
             thunderstore::commands::trigger_mod_fetch,
             thunderstore::commands::get_categories,
             prefs::commands::get_prefs,

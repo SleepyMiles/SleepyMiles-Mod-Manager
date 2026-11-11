@@ -11,6 +11,8 @@
 	import ExportCodeDialog from '$lib/components/dialogs/ExportCodeDialog.svelte';
 	import ImportProfileDialog from '$lib/components/dialogs/ImportProfileDialog.svelte';
 	import AboutDialog from '$lib/components/dialogs/AboutDialog.svelte';
+	import StorageDialog from '$lib/components/dialogs/StorageDialog.svelte';
+	import SendLogsDialog from '$lib/components/dialogs/SendLogsDialog.svelte';
 	import CreateProfileDialog from '$lib/components/dialogs/CreateProfileDialog.svelte';
 
 	import MenubarItem from './MenubarItem.svelte';
@@ -42,6 +44,8 @@
 	let profileOperationInProgress = $state(false);
 
 	let aboutOpen = $state(false);
+	let storageOpen = $state(false);
+	let sendLogsOpen = $state(false);
 
 	let menu: Menu | null = $state(null);
 
@@ -66,14 +70,14 @@
 					text: m.menuBar_file_item_4(),
 					onclick: api.logger.openGaleLog
 				},
+				{
+					text: 'Send logs to Miles…',
+					onclick: () => (sendLogsOpen = true)
+				},
 				'',
 				{
-					text: m.menuBar_file_item_5(),
-					onclick: () => clearModCache(false)
-				},
-				{
-					text: m.menuBar_file_item_6(),
-					onclick: () => clearModCache(true)
+					text: 'Free up space…',
+					onclick: () => (storageOpen = true)
 				},
 				{
 					text: m.menuBar_file_item_7(),
@@ -193,6 +197,11 @@
 		{
 			text: m.menuBar_help_title(),
 			items: [
+				{
+					text: 'Send logs to Miles…',
+					onclick: () => (sendLogsOpen = true)
+				},
+				'',
 				{
 					text: m.menuBar_help_item_1(),
 					onclick: () => shellOpen('https://github.com/SleepyMiles/SleepyMiles-Mod-Manager/issues/')
@@ -317,21 +326,6 @@
 		});
 	}
 
-	async function clearModCache(soft: boolean) {
-		if (!soft) {
-			let result = await confirm(m.menuBar_clearModCache_confirm());
-
-			if (!result) return;
-		}
-
-		let size = await api.profile.install.clearDownloadCache(soft);
-		let messageText = soft
-			? m.menuBar_clearModCache_message_unsed
-			: m.menuBar_clearModCache_message;
-		pushInfoToast({
-			message: messageText({ size: shortenFileSize(size) })
-		});
-	}
 
 	async function copyModList() {
 		await api.profile.export.copyDependencyStrings();
@@ -552,6 +546,8 @@
 </Dialog>
 
 <AboutDialog bind:open={aboutOpen} />
+<StorageDialog bind:open={storageOpen} />
+<SendLogsDialog bind:open={sendLogsOpen} />
 <ImportR2Dialog bind:open={importR2Open} />
 <CreateProfileDialog bind:open={newProfileOpen} />
 <ExportCodeDialog bind:this={exportCodeDialog} />
