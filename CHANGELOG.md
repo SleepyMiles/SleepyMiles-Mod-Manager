@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.12
+
+- Unused config: configs of mods that have no DLL of their own are kept, such as SoundAPI sound packs (`soundpack.*.cfg`, e.g. LethalResonance). A config now also counts as in use if any installed mod's folder or file carries the mod's name.
+
 ## 1.0.11
 
 - **Send logs** is now also on the upload page (cloud icon), above Miles's "Publish a mod" section.

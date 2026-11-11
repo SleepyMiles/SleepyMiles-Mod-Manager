@@ -161,6 +161,62 @@ fn guids_in_dlls(profile: &Path, guids: &[String]) -> Result<HashSet<usize>> {
     Ok(found)
 }
 
+/// Safety net for configs whose plugin has no DLL of its own, like loaforc's SoundAPI sound packs
+/// (SoundAPI writes `soundpack.<Name>.cfg` for each pack): a config is kept if any installed mod's
+/// folder or file name contains the plugin's name, or a `sound_pack.json` mentions it.
+struct InstalledNames {
+    names: Vec<String>,
+    sound_packs: Vec<String>,
+}
+
+fn normalize(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// "LethalResonance v1.0.0" -> "LethalResonance"
+fn plugin_name(created_by: &str) -> &str {
+    match created_by.rsplit_once(' ') {
+        Some((name, ver)) if ver.starts_with(['v', 'V']) || ver.chars().next().is_some_and(|c| c.is_ascii_digit()) => name,
+        _ => created_by,
+    }
+}
+
+impl InstalledNames {
+    fn read(profile: &Path) -> Self {
+        let mut names = Vec::new();
+        let mut sound_packs = Vec::new();
+        for sub in ["plugins", "core", "patchers"] {
+            for entry in walkdir::WalkDir::new(profile.join("BepInEx").join(sub)).into_iter().filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy();
+                names.push(normalize(&name));
+                if name.eq_ignore_ascii_case("sound_pack.json") {
+                    if let Ok(text) = fs::read_to_string(entry.path()) {
+                        sound_packs.push(normalize(&text));
+                    }
+                }
+            }
+        }
+        Self { names, sound_packs }
+    }
+
+    fn mentions(&self, guid: &str, created_by: Option<&str>) -> bool {
+        let mut keys = Vec::new();
+        if let Some(name) = created_by.map(plugin_name).map(normalize) {
+            keys.push(name);
+        }
+        if let Some(pack) = guid.strip_prefix("soundpack.") {
+            let pack = normalize(pack);
+            if self.sound_packs.iter().any(|t| t.contains(&pack)) {
+                return true;
+            }
+            keys.push(pack);
+        }
+        keys.iter()
+            .filter(|k| k.len() >= 4)
+            .any(|k| self.names.iter().any(|n| n.contains(k.as_str())))
+    }
+}
+
 // ---------------------------------------------------------------- scan
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -224,9 +280,10 @@ fn scan(profile: &Path) -> Result<CleanupScan> {
     if !guids.is_empty() {
         let present = guids_in_dlls(profile, &guids)?;
         let present: HashSet<&str> = present.iter().map(|&i| guids[i].as_str()).collect();
+        let installed = InstalledNames::read(profile);
         for (path, _, info) in &cfgs {
             let Some(guid) = &info.guid else { continue };
-            if !present.contains(guid.as_str()) {
+            if !present.contains(guid.as_str()) && !installed.mentions(guid, info.plugin.as_deref()) {
                 out.files.push(UnusedFile {
                     path: rel(profile, path),
                     plugin: info.plugin.clone().unwrap_or_else(|| guid.clone()),
@@ -584,6 +641,29 @@ Dungeon Injection Settings - Manual Level Names List = Rend:300\r\n\
         assert!(!result.sections.iter().any(|s| s.section.contains("LC Office")));
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn sound_packs_without_dlls_are_kept() {
+        let dir = profile_with("sp", LLL, "imabatby.lethallevelloader");
+        fs::write(
+            dir.join("BepInEx/config/soundpack.LethalResonance.cfg"),
+            "## Settings file was created by plugin LethalResonance v1.0.0\n## Plugin GUID: soundpack.LethalResonance\n\n[A]\n# Setting type: Boolean\nX = true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("BepInEx/plugins/LethalResonance-LETHALRESONANCE/LethalResonance/replacers")).unwrap();
+        fs::write(dir.join("BepInEx/plugins/LethalResonance-LETHALRESONANCE/LethalResonance/sound_pack.json"), "{\"name\": \"LethalResonance\"}").unwrap();
+        let result = scan(&dir).unwrap();
+        let files: Vec<_> = result.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, vec!["BepInEx/config/gone.mod.cfg"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_names() {
+        assert_eq!(plugin_name("LethalResonance v1.0.0"), "LethalResonance");
+        assert_eq!(plugin_name("Lethal Things 0.10.7"), "Lethal Things");
+        assert_eq!(plugin_name("Emblem"), "Emblem");
     }
 
     #[test]
