@@ -35,7 +35,7 @@
 			// Publishing mods to SleepyMiles' site. Only works when logged in as SleepyMiles.
 			to: '/upload',
 			icon: 'mdi:cloud-upload',
-			tooltip: "Upload to SleepyMiles' site"
+			tooltip: 'Send logs / Publish mods'
 		},
 		{
 			to: '/prefs',

@@ -17,6 +17,7 @@ mod prefs;
 mod profile;
 mod site_upload;
 mod storage;
+mod config_cleanup;
 mod send_logs;
 mod state;
 mod thunderstore;
@@ -151,6 +152,8 @@ pub fn run() {
             storage::free_unused_space,
             storage::clear_all_cache,
             storage::delete_gale_leftovers,
+            config_cleanup::scan_unused_config,
+            config_cleanup::remove_unused_config,
             send_logs::logs_info,
             send_logs::send_logs,
             send_logs::save_logs,

@@ -1972,6 +1972,7 @@ dependencies = [
 name = "gale"
 version = "1.23.3"
 dependencies = [
+ "aho-corasick",
  "ashpd",
  "base64 0.22.1",
  "blake3",

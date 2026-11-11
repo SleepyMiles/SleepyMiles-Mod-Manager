@@ -22,3 +22,19 @@ export const freeUnused = () => invoke<number>('free_unused_space');
 export const clearAllCache = () => invoke<number>('clear_all_cache');
 export const deleteGaleLeftovers = (evenIfInstalled: boolean) =>
 	invoke<number>('delete_gale_leftovers', { evenIfInstalled });
+
+/** See src-tauri/src/config_cleanup.rs. */
+export type UnusedConfigFile = { path: string; plugin: string; size: number };
+export type UnusedConfigSection = { path: string; section: string; settings: number };
+export type ConfigCleanupScan = {
+	profile: string;
+	files: UnusedConfigFile[];
+	sections: UnusedConfigSection[];
+	notes: string[];
+	checkedFiles: number;
+};
+export type ConfigCleanupResult = { filesRemoved: number; sectionsRemoved: number; backup: string };
+
+export const scanUnusedConfig = () => invoke<ConfigCleanupScan>('scan_unused_config');
+export const removeUnusedConfig = (files: string[], sections: UnusedConfigSection[]) =>
+	invoke<ConfigCleanupResult>('remove_unused_config', { files, sections });

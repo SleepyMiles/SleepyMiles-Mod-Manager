@@ -10,6 +10,8 @@
 	import { shortenFileSize } from '$lib/util';
 	import { pushInfoToast } from '$lib/toast';
 	import { confirm } from '@tauri-apps/plugin-dialog';
+	import Checkbox from '$lib/components/ui/Checkbox.svelte';
+	import type { ConfigCleanupScan } from '$lib/api/storage';
 
 	type Props = { open?: boolean };
 	let { open = $bindable(false) }: Props = $props();
@@ -17,9 +19,60 @@
 	let report = $state<StorageReport | null>(null);
 	let busy = $state<'unused' | 'cache' | 'gale' | null>(null);
 
+	// unused config (active profile)
+	let cfg = $state<ConfigCleanupScan | null>(null);
+	let cfgChecking = $state(false);
+	let cfgRemoving = $state(false);
+	let keepFiles = $state<Record<string, boolean>>({});
+	let keepSections = $state<Record<string, boolean>>({});
+
+	const sectionKey = (s: { path: string; section: string }) => `${s.path}\n${s.section}`;
+
 	$effect(() => {
-		if (open) refresh();
+		if (open) {
+			refresh();
+			cfg = null;
+		}
 	});
+
+	async function checkConfig() {
+		cfgChecking = true;
+		keepFiles = {};
+		keepSections = {};
+		try {
+			cfg = await api.storage.scanUnusedConfig();
+		} catch {
+		} finally {
+			cfgChecking = false;
+		}
+	}
+
+	let cfgChosenFiles = $derived(cfg ? cfg.files.filter((f) => !keepFiles[f.path]) : []);
+	let cfgChosenSections = $derived(
+		cfg ? cfg.sections.filter((s) => !keepSections[sectionKey(s)]) : []
+	);
+
+	async function removeConfig() {
+		if (!cfg) return;
+		cfgRemoving = true;
+		try {
+			const result = await api.storage.removeUnusedConfig(
+				cfgChosenFiles.map((f) => f.path),
+				cfgChosenSections
+			);
+			pushInfoToast({
+				message: `Removed ${result.filesRemoved} config file${result.filesRemoved === 1 ? '' : 's'} and ${result.sectionsRemoved} unused section${result.sectionsRemoved === 1 ? '' : 's'}. A backup was saved first.`
+			});
+			await checkConfig();
+		} catch {
+		} finally {
+			cfgRemoving = false;
+		}
+	}
+
+	function fileName(path: string) {
+		return path.split('/').pop() ?? path;
+	}
 
 	async function refresh() {
 		report = null;
@@ -166,6 +219,99 @@
 					</div>
 				</div>
 			{/if}
+
+			<!-- unused config -->
+			<div class="dark:bg-primary-900 bg-primary-100 rounded-lg p-4">
+				<div class="flex items-start gap-3">
+					<Icon icon="mdi:file-cog" class="text-primary-500 mt-0.5 shrink-0 text-2xl" />
+					<div class="grow">
+						<p class="text-primary-900 font-semibold dark:text-white">
+							Unused config {#if cfg}<span class="text-primary-500 ml-1 text-sm font-normal"
+									>profile {cfg.profile}</span
+								>{/if}
+						</p>
+						<p class="text-primary-600 dark:text-primary-300 mt-1 text-sm">
+							Config files of mods that are no longer in this profile, and LethalLevelLoader
+							settings for interiors and moons you removed. Settings of mods you still have are
+							never touched, and a backup is made first. Config files are small, so this is
+							mostly about tidiness.
+						</p>
+					</div>
+					<Button
+						color="primary"
+						icon="mdi:magnify"
+						onclick={checkConfig}
+						loading={cfgChecking}
+						disabled={busy !== null || cfgRemoving}>{cfg ? 'Check again' : 'Check'}</Button
+					>
+				</div>
+
+				{#if cfg}
+					{#each cfg.notes as note}
+						<p class="text-primary-600 dark:text-primary-300 mt-3 flex items-start gap-2 text-sm">
+							<Icon icon="mdi:information" class="mt-0.5 shrink-0" />{note}
+						</p>
+					{/each}
+
+					{#if cfg.files.length === 0 && cfg.sections.length === 0}
+						<p class="mt-3 flex items-center gap-2 text-sm text-green-500">
+							<Icon icon="mdi:check-circle" /> Nothing unused in {cfg.checkedFiles} config files.
+						</p>
+					{:else}
+						<div class="mt-3 max-h-72 overflow-y-auto pr-1 text-sm">
+							{#if cfg.files.length > 0}
+								<p class="text-primary-700 dark:text-primary-200 mb-1 font-medium">
+									Files of removed mods
+								</p>
+								{#each cfg.files as file (file.path)}
+									<label class="flex items-center gap-2 py-0.5">
+										<Checkbox
+											checked={!keepFiles[file.path]}
+											onCheckedChange={(v) => (keepFiles[file.path] = !v)}
+										/>
+										<span class="text-primary-800 dark:text-primary-100 truncate">{file.plugin}</span>
+										<span class="text-primary-500 dark:text-primary-400 ml-auto shrink-0 truncate"
+											>{fileName(file.path)}</span
+										>
+									</label>
+								{/each}
+							{/if}
+							{#if cfg.sections.length > 0}
+								<p class="text-primary-700 dark:text-primary-200 mt-2 mb-1 font-medium">
+									Removed interiors and moons (LethalLevelLoader.cfg)
+								</p>
+								{#each cfg.sections as section (sectionKey(section))}
+									<label class="flex items-center gap-2 py-0.5">
+										<Checkbox
+											checked={!keepSections[sectionKey(section)]}
+											onCheckedChange={(v) => (keepSections[sectionKey(section)] = !v)}
+										/>
+										<span class="text-primary-800 dark:text-primary-100 truncate"
+											>{section.section}</span
+										>
+										<span class="text-primary-500 dark:text-primary-400 ml-auto shrink-0"
+											>{section.settings} setting{section.settings === 1 ? "" : "s"}</span
+										>
+									</label>
+								{/each}
+								<p class="text-primary-500 dark:text-primary-400 mt-1 text-xs">
+									If one of these is from a mod you only turned off for now, untick it, or its
+									LethalLevelLoader settings go back to default when you turn it on again.
+								</p>
+							{/if}
+						</div>
+						<div class="mt-3 flex justify-end">
+							<Button
+								icon="mdi:delete-sweep"
+								onclick={removeConfig}
+								loading={cfgRemoving}
+								disabled={cfgChosenFiles.length + cfgChosenSections.length === 0}
+								>Remove {cfgChosenFiles.length + cfgChosenSections.length} selected</Button
+							>
+						</div>
+					{/if}
+				{/if}
+			</div>
 
 			<p class="text-primary-500 dark:text-primary-400 text-xs">
 				Deleting a profile now also deletes its mods' downloads when no other profile uses them.

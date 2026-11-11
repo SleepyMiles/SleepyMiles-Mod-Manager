@@ -13,6 +13,7 @@
 	import type { DeviceLogin, SiteModInfo } from '$lib/api/site';
 	import { shortenFileSize, SLEEPYMILES_SITE_URL } from '$lib/util';
 	import { pushInfoToast } from '$lib/toast';
+	import SendLogsForm from '$lib/components/misc/SendLogsForm.svelte';
 
 	let account = $state<string | null>(null);
 	let checkingAccount = $state(true);
@@ -136,12 +137,23 @@
 </script>
 
 <div class="relative mx-auto flex w-full max-w-4xl flex-col gap-4 overflow-y-auto px-6 py-4">
+	<!-- Send logs (everyone) -->
+	<section>
+		<h1 class="text-primary-900 flex items-center gap-2 text-2xl font-semibold dark:text-white">
+			<Icon icon="mdi:file-send" class="text-accent-500" /> Send logs to Miles
+		</h1>
+		<SendLogsForm />
+	</section>
+
+	<hr class="border-primary-700 my-2" />
+
+	<!-- Publish (Miles only) -->
 	<div>
-		<h1 class="text-primary-900 text-2xl font-semibold dark:text-white">
-			Upload to SleepyMiles' site
+		<h1 class="text-primary-900 flex items-center gap-2 text-2xl font-semibold dark:text-white">
+			<Icon icon="mdi:cloud-upload" class="text-accent-500" /> Publish a mod to the site
 		</h1>
 		<p class="text-primary-600 dark:text-primary-300 mt-1">
-			Publish a new mod, a fork, or an update. It shows up on
+			For Miles only. Publish a new mod, a fork, or an update. It shows up on
 			<Link href={SLEEPYMILES_SITE_URL}>the site</Link> and in everyone's mod list a minute or two later.
 		</p>
 	</div>
